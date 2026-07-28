@@ -10,6 +10,16 @@ import jax.numpy as jnp
 import flax.nnx as nnx
 
 
+class RopeCache(nnx.Variable):
+    """Precomputed cos/sin table.
+
+    A distinct Variable type (not nnx.Param) so `nnx.split(model, nnx.Param, ...)`
+    keeps it out of the trainable state: these tables are constants, and if they
+    land in the optimizer they both get gradient updates (silently drifting the
+    positional encoding) and carry a full-size momentum buffer.
+    """
+
+
 def _yarn_find_correction_dim(num_rotations: float, dim: int, base: float,
                               max_position_embeddings: int, beta_fast: float, beta_slow: float) -> float:
     return (dim * jnp.log(max_position_embeddings / (2 * jnp.pi))) / (2 * num_rotations * jnp.log(base))

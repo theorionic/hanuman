@@ -33,13 +33,20 @@ def get_tokenizer(config: Config):
     if config.tokenizer == "byte":
         return ByteTokenizer(vocab_size=config.vocab_size)
     elif config.tokenizer == "llama3":
-        try:
-            from transformers import AutoTokenizer
-            tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
-            return tok
-        except Exception as e:
-            print(f"[data] Could not load Llama3 tokenizer ({e}); falling back to byte tokenizer")
-            return ByteTokenizer(vocab_size=config.vocab_size)
+        # meta-llama is a gated repo; without HF credentials it 401s. Fall back
+        # to an ungated mirror of the 32000-entry Llama tokenizer rather than to
+        # bytes -- a byte tokenizer under a 32000 vocab leaves 99% of the
+        # embedding table permanently untrained, which silently wrecks the run.
+        from transformers import AutoTokenizer
+        for name in ("meta-llama/Llama-3.2-1B", "hf-internal-testing/llama-tokenizer"):
+            try:
+                tok = AutoTokenizer.from_pretrained(name)
+                print(f"[data] Tokenizer: {name} (vocab {tok.vocab_size})")
+                return tok
+            except Exception as e:
+                print(f"[data] Could not load {name} ({str(e)[:80]})")
+        print("[data] Falling back to byte tokenizer")
+        return ByteTokenizer(vocab_size=config.vocab_size)
     else:
         try:
             from transformers import AutoTokenizer
@@ -53,7 +60,9 @@ def stream_dataset(config: Config) -> Iterator[str]:
     """Stream text from Ultra-FineWeb-L3 (or fall back to synthetic data)."""
     try:
         from datasets import load_dataset
-        ds = load_dataset(config.dataset, split="train", streaming=True)
+        # Ultra-FineWeb-L3 has no default config; a name must be given.
+        ds = load_dataset(config.dataset, getattr(config, "dataset_config", None),
+                          split="train", streaming=True)
         for ex in ds:
             # Ultra-FineWeb-L3 has a 'text' field
             text = ex.get("text", "")
@@ -88,6 +97,8 @@ def make_batches(config: Config, batch_size: int, seq_len: int, tokenizer=None) 
     if tokenizer is None:
         tokenizer = get_tokenizer(config)
     eos = getattr(tokenizer, "eos_id", None)
+    if eos is None:
+        eos = getattr(tokenizer, "eos_token_id", None)  # HF tokenizers
     if eos is None:
         eos = config.vocab_size - 1
 

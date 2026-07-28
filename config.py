@@ -57,9 +57,11 @@ class Config:
     grad_clip: float = 1.0
     dtype: str = "bf16"              # compute dtype
     master_dtype: str = "fp32"       # master weights
+    remat: bool = True               # rematerialize each block in the backward pass
 
     # ---- Data ----
     dataset: str = "openbmb/Ultra-FineWeb-L3"
+    dataset_config: Optional[str] = "Ultra-FineWeb-L3-en-Multi-Style-Synthetic"
     tokenizer: str = "byte"          # 'byte' | 'llama3' | path
     pack_eos_id: Optional[int] = None
 
@@ -128,7 +130,9 @@ def full() -> Config:
         n_shared_experts=1,
         d_ff=768,
         dense_layers=3,
-        batch_size=4,
+        # One sequence per v5e chip: the batch axis is sharded over the 8-way
+        # 'data' mesh axis, so batch_size must stay a multiple of the device count.
+        batch_size=8,
         seq_len=4096,
         train_steps=100000,
         warmup_steps=2000,

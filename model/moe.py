@@ -10,9 +10,19 @@ Key features:
 """
 from __future__ import annotations
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import flax.nnx as nnx
+from jax.sharding import PartitionSpec as P
+
+from .sharding import expert_shard_axis
+
+try:
+    from jax.experimental.pallas.ops.tpu import megablox as _megablox
+except ImportError:  # non-TPU backends
+    _megablox = None
 
 
 def swiglu(x, w_gate, w_up, w_down, dtype):
@@ -22,6 +32,72 @@ def swiglu(x, w_gate, w_up, w_down, dtype):
     h = g * u
     out = h @ w_down.astype(dtype)
     return out.astype(jnp.float32)
+
+
+_ROW_ALIGN = 128  # TPU tile alignment for the grouped-matmul row dimension
+_TILE = 128       # Pallas gmm tile size; K and N must be multiples of it
+
+
+def grouped_matmul(xs, w, group_sizes):
+    """One grouped matmul: row block `g` of `xs` times `w[g]`.
+
+    Prefers the Pallas `megablox.gmm` kernel over `jax.lax.ragged_dot`. Both
+    compute the same thing, but ragged_dot's TPU lowering cannot build a
+    backward pass when its operand is produced by a collective -- which is
+    exactly our case, since the expert weights arrive via an all_gather inside
+    shard_map ("Pattern match for backwards collectives + grad_y - NYI"). gmm
+    is a custom_vjp whose backward is itself a Pallas kernel (tgmm), so there is
+    no ragged_dot backward for XLA to choke on.
+
+    Falls back to ragged_dot when the shapes are not tileable (small configs)
+    or the kernel is unavailable.
+    """
+    K, N = w.shape[-2], w.shape[-1]
+    if _megablox is not None and K % _TILE == 0 and N % _TILE == 0 and xs.shape[0] % _TILE == 0:
+        return _megablox.gmm(xs, w, group_sizes, preferred_element_type=jnp.float32)
+    return jax.lax.ragged_dot(xs, w, group_sizes)
+
+
+def ragged_dispatch(x_flat, top_idx, weights, w_gate, w_up, w_down, dtype):
+    """Route each token to its top-k experts and run SwiGLU, one dot per expert.
+
+    x_flat:  [T, D]      tokens
+    top_idx: [T, K]      selected expert id per token
+    weights: [T, K]      gate weight per (token, slot)
+    w_*:     [N, D, F] / [N, F, D]  stacked expert weights
+
+    Every (token, slot) pair becomes one row; rows are sorted by expert id so
+    that `jax.lax.ragged_dot` can do the whole layer as three grouped matmuls.
+    Cost is O(T*K*D*F) instead of the O(T*K*N*D*F) a dense-all-experts pass
+    would need, and no per-token copy of the expert weights is materialized.
+    """
+    T, D = x_flat.shape
+    K = top_idx.shape[1]
+    N = w_gate.shape[0]
+
+    slot_expert = top_idx.reshape(-1)                 # [T*K]
+    order = jnp.argsort(slot_expert)                  # stable -> rows grouped by expert
+    xs = x_flat[order // K].astype(dtype)             # [T*K, D] tokens in expert order
+    group_sizes = jnp.bincount(slot_expert, length=N)  # [N] rows per expert
+
+    # The TPU grouped-matmul kernels require the row count to be a multiple of
+    # the tile size. Pad with rows that belong to no group (group_sizes still
+    # sums to T*K, so the padding contributes nothing) and drop them after.
+    rows = T * K
+    padded = -(-rows // _ROW_ALIGN) * _ROW_ALIGN
+    if padded != rows:
+        xs = jnp.pad(xs, ((0, padded - rows), (0, 0)))
+
+    g = grouped_matmul(xs, w_gate.astype(dtype), group_sizes)   # [rows, F]
+    u = grouped_matmul(xs, w_up.astype(dtype), group_sizes)     # [rows, F]
+    h = (jax.nn.silu(g) * u).astype(dtype)
+    ys = grouped_matmul(h, w_down.astype(dtype), group_sizes)   # [rows, D]
+    ys = ys[:rows]
+
+    # Undo the permutation, then combine the K slots of each token.
+    out = jnp.zeros((T * K, D), ys.dtype).at[order].set(ys)
+    out = out.reshape(T, K, D).astype(jnp.float32)
+    return jnp.sum(out * weights[..., None], axis=1)  # [T, D]
 
 
 class DenseFFN(nnx.Module):
@@ -64,7 +140,9 @@ class MoE(nnx.Module):
 
     def __init__(self, d_model: int, d_ff: int, n_experts: int, n_active: int,
                  n_shared_experts: int, router_init_std: float, routed_scaling_factor: float,
-                 dtype, rngs: nnx.Rngs):
+                 dtype, rngs: nnx.Rngs, mesh=None):
+        self.mesh = mesh
+        self.expert_axis_name = expert_shard_axis(n_experts, mesh) if mesh is not None else None
         self.n_experts = n_experts
         self.n_active = n_active
         self.n_shared_experts = n_shared_experts
@@ -127,35 +205,56 @@ class MoE(nnx.Module):
         denom = jnp.sum(selected_scores, axis=-1, keepdims=True) + 1e-9
         weights = (selected_scores / denom) * self.routed_scaling_factor  # [B, S, K]
 
-        # ---- Compute routed expert outputs via per-token dispatch ----
+        # ---- Compute routed expert outputs via sorted ragged dispatch ----
         # Flatten to [B*S, D]
         x_flat = x_f.reshape(B * S, D)
         top_idx_flat = top_idx.reshape(B * S, K)  # [BS, K]
         weights_flat = weights.reshape(B * S, K)  # [BS, K]
 
-        # For each token and each selected expert, compute expert(x).
-        # We do this with a vectorized gather: build [BS, K, D] by selecting expert weights.
-        # expert_w_gate: [N, D, d_ff]
-        # For each (token, k): x_flat[token] @ expert_w_gate[top_idx_flat[token,k]]
-        # Use vmap over K.
-        def expert_for_idx(token_idx, k_idx):
-            e = top_idx_flat[token_idx, k_idx]
-            wg = self.expert_w_gate[e]
-            wu = self.expert_w_up[e]
-            wd = self.expert_w_down[e]
-            return swiglu(x_flat[token_idx], wg, wu, wd, self.dtype)
+        # Cast before dispatch: on a mesh the expert weights are all-gathered on
+        # the way in, and gathering bf16 moves half the bytes of fp32.
+        wg = self.expert_w_gate.value.astype(self.dtype)
+        wu = self.expert_w_up.value.astype(self.dtype)
+        wd = self.expert_w_down.value.astype(self.dtype)
+        if self.mesh is not None and self.mesh.devices.size > 1:
+            # Pin the gather (and the cast feeding it) inside this layer. Blocks
+            # run under lax.scan, and XLA is otherwise free to hoist the gather
+            # out of the loop -- gathering every layer's experts at once, in
+            # fp32, which is a 7.4 GiB buffer for the 7B config and instantly
+            # exhausts a 16 GB v5e chip. The barrier keeps it to one bf16
+            # layer's worth at a time.
+            wg, wu, wd = jax.lax.optimization_barrier((wg, wu, wd))
 
-        token_idxs = jnp.arange(B * S)
-        # vmap over tokens and k
-        def per_token(ti):
-            ks = jnp.arange(K)
-            def per_k(ki):
-                return expert_for_idx(ti, ki)
-            outs = jax.vmap(per_k)(ks)  # [K, D]
-            return outs
-        expert_outs = jax.vmap(per_token)(token_idxs)  # [BS, K, D]
-        # weighted sum
-        routed_out = jnp.sum(expert_outs * weights_flat[..., None], axis=1)  # [BS, D]
+        if self.mesh is None or self.mesh.devices.size == 1:
+            routed_out = ragged_dispatch(x_flat, top_idx_flat, weights_flat,
+                                         wg, wu, wd, self.dtype)
+        else:
+            # jax.lax.ragged_dot has no GSPMD partitioning rule, so it has to run
+            # on per-device-local shapes. shard_map gives us exactly that: each
+            # device dispatches its own slice of the batch over the full set of
+            # experts, which it gathers on entry (FSDP).
+            #
+            # The gather is written out explicitly rather than left to the
+            # shard_map boundary. Handing the weights in as replicated (P())
+            # also works forward, but its transpose is a psum, so the backward
+            # pass builds a *replicated* fp32 gradient for every layer at once
+            # -- 7.4 GiB for the 7B config, which no 16 GB chip can hold.
+            # Passing them in sharded makes the transpose a reduce-scatter, so
+            # the gradient stays sharded and matches the parameter layout.
+            axis = self.expert_axis_name
+            w_spec = P() if axis is None else P(axis, None, None)
+
+            @partial(jax.shard_map, mesh=self.mesh,
+                     in_specs=(P("data", None), P("data", None), P("data", None),
+                               w_spec, w_spec, w_spec),
+                     out_specs=P("data", None), check_vma=False)
+            def local_dispatch(xs, idx, wts, wg, wu, wd):
+                if axis is not None:
+                    wg, wu, wd = (jax.lax.all_gather(w, axis, axis=0, tiled=True)
+                                  for w in (wg, wu, wd))
+                return ragged_dispatch(xs, idx, wts, wg, wu, wd, self.dtype)
+
+            routed_out = local_dispatch(x_flat, top_idx_flat, weights_flat, wg, wu, wd)
         routed_out = routed_out.reshape(B, S, D)
 
         # ---- Shared expert (always on, weight 1.0) ----

@@ -16,14 +16,10 @@ class Attention(nnx.Module):
     """
 
     def __init__(self, d_model: int, n_q_heads: int, n_kv_heads: int, head_dim: int,
-                 rope_base: float, yarn_factor: float, max_seq_len: int,
                  dtype, rngs: nnx.Rngs):
         self.n_q_heads = n_q_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
-        self.rope_base = rope_base
-        self.yarn_factor = yarn_factor
-        self.max_seq_len = max_seq_len
         self.dtype = dtype
 
         qkv_dim = n_q_heads * head_dim
@@ -34,15 +30,7 @@ class Attention(nnx.Module):
         self.wv = nnx.Param(jax.random.normal(rngs.params(), (d_model, kv_dim)) * std)
         self.wo = nnx.Param(jax.random.normal(rngs.params(), (qkv_dim, d_model)) * std)
 
-        # Precompute RoPE tables (registered as a buffer-like Param so it's in state,
-        # but we mark it non-trainable by not including in optimizer mask).
-        cos, sin = precompute_rope(head_dim, max_seq_len, rope_base, yarn_factor)
-        # store as plain arrays (not nnx.Param) -> they won't be in nnx.split state by default?
-        # Actually nnx stores attributes that are arrays as part of state. Use a separate holder.
-        self.cos = cos.astype(dtype)
-        self.sin = sin.astype(dtype)
-
-    def __call__(self, x, positions=None):
+    def __call__(self, x, cos, sin, positions=None):
         B, S, D = x.shape
         x = x.astype(self.dtype)
         q = x @ self.wq.astype(self.dtype)  # [B, S, Nq*H]
@@ -52,7 +40,7 @@ class Attention(nnx.Module):
         k = k.reshape(B, S, self.n_kv_heads, self.head_dim)
         v = v.reshape(B, S, self.n_kv_heads, self.head_dim)
 
-        q, k = apply_rope(q, k, self.cos, self.sin, positions)
+        q, k = apply_rope(q, k, cos.astype(self.dtype), sin.astype(self.dtype), positions)
 
         # jax.nn.dot_product_attention expects BTNH / BSKH layout, handles GQA
         out = jax.nn.dot_product_attention(q, k, v, is_causal=True)

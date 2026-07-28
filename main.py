@@ -26,8 +26,14 @@ def cmd_train(args):
         config.batch_size = args.batch
     if args.seq_len is not None:
         config.seq_len = args.seq_len
+    if args.remat is not None:
+        config.remat = args.remat
+    if args.data_axis is not None:
+        config.mesh_data_axis = args.data_axis
+    if args.expert_axis is not None:
+        config.mesh_expert_axis = args.expert_axis
     use_random = args.config == "smoke" or args.random_data
-    train(config, use_random_data=use_random)
+    train(config, use_random_data=use_random, save=not args.no_save)
 
 
 def cmd_generate(args):
@@ -68,6 +74,13 @@ def main():
     p_train.add_argument("--batch", type=int, default=None)
     p_train.add_argument("--seq_len", type=int, default=None)
     p_train.add_argument("--random_data", action="store_true", help="Force random data")
+    p_train.add_argument("--no_save", action="store_true", help="Skip the final checkpoint")
+    p_train.add_argument("--data_axis", type=int, default=None, help="Mesh 'data' axis size")
+    p_train.add_argument("--expert_axis", type=int, default=None, help="Mesh 'expert' axis size")
+    p_train.add_argument("--remat", dest="remat", action="store_true", default=None,
+                         help="Force block rematerialization on")
+    p_train.add_argument("--no_remat", dest="remat", action="store_false",
+                         help="Disable block rematerialization")
     p_train.set_defaults(func=cmd_train)
 
     p_gen = sub.add_parser("generate", help="Generate text")

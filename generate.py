@@ -24,10 +24,12 @@ def load_for_generate(config: Config, prompt: str, max_tokens: int = 100,
     import orbax.checkpoint as ocp
     import jax.tree_util as tree_util
 
-    # Build a fresh model to get graphdef + state structure
+    # Build a fresh model to get graphdef + state structure. Split trainable
+    # params from buffers exactly like training does: checkpoints hold params
+    # only (the RoPE tables are constants, rebuilt here from the config).
     dtype = config.compute_dtype()
     model = Transformer(config, dtype, nnx.Rngs(0))
-    graphdef, state = nnx.split(model)
+    graphdef, state, rest = nnx.split(model, nnx.Param, ...)
     del model
 
     # Find latest checkpoint
@@ -62,7 +64,8 @@ def load_for_generate(config: Config, prompt: str, max_tokens: int = 100,
         merged_leaves.append(jnp.asarray(sl).astype(fl.dtype) if hasattr(fl, 'dtype') else sl)
     state = jax.tree_util.tree_unflatten(fresh_treedef, merged_leaves)
 
-    return generate(config, state, graphdef, prompt, max_tokens, temperature, top_k, seed)
+    return generate(config, state, graphdef, prompt, max_tokens, temperature, top_k, seed,
+                    rest=rest)
 
 
 def sample_next(logits, temperature: float = 1.0, top_k: int = 0, rng=None):
@@ -83,7 +86,7 @@ def sample_next(logits, temperature: float = 1.0, top_k: int = 0, rng=None):
 
 
 def generate(config: Config, state, graphdef, prompt: str, max_tokens: int = 100,
-             temperature: float = 1.0, top_k: int = 0, seed: int = 0):
+             temperature: float = 1.0, top_k: int = 0, seed: int = 0, rest=None):
     """Generate text from a prompt using the model.
 
     For YaRN: set config.yarn_factor=8.0 before building the model for 32K context.
@@ -102,7 +105,7 @@ def generate(config: Config, state, graphdef, prompt: str, max_tokens: int = 100
     if not ids:
         ids = [0]
 
-    model = nnx.merge(graphdef, state)
+    model = nnx.merge(graphdef, state) if rest is None else nnx.merge(graphdef, state, rest)
     seq_len = config.seq_len
     pad_id = 0
 

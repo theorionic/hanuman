@@ -7,6 +7,7 @@ import flax.nnx as nnx
 
 from .attention import Attention
 from .moe import MoE, DenseFFN
+from .rope import RopeCache, precompute_rope
 
 
 class RMSNorm(nnx.Module):
@@ -32,25 +33,23 @@ class Block(nnx.Module):
                  d_ff: int, n_experts: int, n_active: int, n_shared_experts: int,
                  router_init_std: float, routed_scaling_factor: float,
                  norm_eps: float, residual_scale_init: float,
-                 rope_base: float, yarn_factor: float, max_seq_len: int,
-                 use_moe: bool, dtype, rngs: nnx.Rngs):
+                 use_moe: bool, dtype, rngs: nnx.Rngs, mesh=None):
         self.norm1 = RMSNorm(d_model, norm_eps, dtype)
-        self.attn = Attention(d_model, n_q_heads, n_kv_heads, head_dim,
-                              rope_base, yarn_factor, max_seq_len, dtype, rngs)
+        self.attn = Attention(d_model, n_q_heads, n_kv_heads, head_dim, dtype, rngs)
         self.norm2 = RMSNorm(d_model, norm_eps, dtype)
         if use_moe:
             self.ffn = MoE(d_model, d_ff, n_experts, n_active, n_shared_experts,
-                           router_init_std, routed_scaling_factor, dtype, rngs)
+                           router_init_std, routed_scaling_factor, dtype, rngs, mesh=mesh)
         else:
             self.ffn = DenseFFN(d_model, d_ff, dtype, rngs)
         self.use_moe = use_moe
         # residual scale (DeepSeek-style learnable scalar, init 1.0)
         self.residual_scale = nnx.Param(jnp.array(residual_scale_init, dtype=jnp.float32))
 
-    def __call__(self, x, positions=None):
+    def __call__(self, x, cos, sin, positions=None):
         # pre-norm attention
         h = self.norm1(x)
-        a = self.attn(h, positions=positions)
+        a = self.attn(h, cos, sin, positions=positions)
         x = x + self.residual_scale.astype(jnp.float32) * a
         # pre-norm FFN
         h = self.norm2(x)
@@ -64,10 +63,44 @@ class Block(nnx.Module):
             return x, {}
 
 
+class BlockStack(nnx.Module):
+    """`n` structurally identical blocks with their params stacked on axis 0.
+
+    The forward pass is one `lax.scan`, so XLA compiles a single block body
+    instead of `n` unrolled copies. That keeps compile time and compiler memory
+    flat in depth -- unrolling 21 MoE layers (each with its own shard_map and
+    remat region) produced an HLO graph that took minutes and hundreds of GB of
+    host RAM to optimize.
+    """
+
+    def __init__(self, n: int, make_block, remat: bool):
+        blocks = [make_block() for _ in range(n)]
+        graphdefs, states = zip(*[nnx.split(b) for b in blocks])
+        # Same structure for every block, so stacking leaf-by-leaf gives one
+        # Block whose parameters carry a leading layer axis.
+        stacked = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *states)
+        self.blocks = nnx.merge(graphdefs[0], stacked)
+        self.n = n
+        self.remat = remat
+
+    def __call__(self, x, cos, sin, positions=None):
+        graphdef, state = nnx.split(self.blocks)
+
+        def body(carry, layer_state):
+            block = nnx.merge(graphdef, layer_state)
+            return block(carry, cos, sin, positions=positions)
+
+        # Remat per scan iteration: only the layer boundary activation is kept
+        # for the backward pass, everything inside the block is recomputed.
+        f = jax.checkpoint(body) if self.remat else body
+        x, aux = jax.lax.scan(f, x, state)
+        return x, aux
+
+
 class Transformer(nnx.Module):
     """Full MoE transformer with embedding tying."""
 
-    def __init__(self, config, dtype, rngs: nnx.Rngs):
+    def __init__(self, config, dtype, rngs: nnx.Rngs, mesh=None):
         self.config = config
         self.dtype = dtype
         self.vocab_size = config.vocab_size
@@ -77,10 +110,19 @@ class Transformer(nnx.Module):
         std = (1.0 / config.d_model) ** 0.5
         self.wte = nnx.Param(jax.random.normal(rngs.params(), (config.vocab_size, config.d_model)) * std)
 
-        self.blocks: list = nnx.data([])
-        for i in range(config.layers):
-            use_moe = i >= config.dense_layers
-            b = Block(
+        # One RoPE table shared by every layer: it is a constant, identical
+        # across blocks, so storing it per-block would replicate it `layers`
+        # times in HBM for no reason.
+        max_seq_len = max(config.seq_len, config.infer_seq_len)
+        cos, sin = precompute_rope(config.head_dim, max_seq_len,
+                                   config.rope_base, config.yarn_factor,
+                                   config.yarn_beta_fast, config.yarn_beta_slow)
+        self.rope_cos = RopeCache(cos.astype(dtype))
+        self.rope_sin = RopeCache(sin.astype(dtype))
+
+        # Dense and MoE blocks differ structurally, so they form two stacks.
+        def make_block(use_moe):
+            return lambda: Block(
                 d_model=config.d_model,
                 n_q_heads=config.n_q_heads,
                 n_kv_heads=config.n_kv_heads,
@@ -93,38 +135,37 @@ class Transformer(nnx.Module):
                 routed_scaling_factor=config.routed_scaling_factor,
                 norm_eps=config.norm_eps,
                 residual_scale_init=config.residual_scale_init,
-                rope_base=config.rope_base,
-                yarn_factor=config.yarn_factor,
-                max_seq_len=max(config.seq_len, config.infer_seq_len),
                 use_moe=use_moe,
                 dtype=dtype,
                 rngs=rngs,
+                mesh=mesh,
             )
-            self.blocks.append(b)
+
+        remat = getattr(config, "remat", True)
+        self.n_dense = config.dense_layers
+        self.n_moe = config.layers - config.dense_layers
+        self.dense_stack = BlockStack(self.n_dense, make_block(False), remat) if self.n_dense else None
+        self.moe_stack = BlockStack(self.n_moe, make_block(True), remat) if self.n_moe else None
 
         self.norm_f = RMSNorm(config.d_model, config.norm_eps, dtype)
 
     def __call__(self, tokens, positions=None):
         """tokens: [B, S] int. Returns logits [B, S, vocab]."""
         x = self.wte[tokens].astype(jnp.float32)  # [B, S, D]
-        aux_all = {}
-        for block in self.blocks:
-            x, aux = block(x, positions=positions)
-            if aux:
-                # accumulate aux from MoE layers
-                for k, v in aux.items():
-                    if k in aux_all:
-                        aux_all[k] = aux_all[k] + v
-                    else:
-                        aux_all[k] = v
+        cos, sin = self.rope_cos.value, self.rope_sin.value
+
+        if self.dense_stack is not None:
+            x, _ = self.dense_stack(x, cos, sin, positions)
+        aux_stacked = {}
+        if self.moe_stack is not None:
+            x, aux_stacked = self.moe_stack(x, cos, sin, positions)
+
         x = self.norm_f(x)
         # tied output projection: logits = x @ wte.T
         logits = x @ self.wte.T.astype(jnp.float32)  # [B, S, vocab]
-        n_moe = max(1, len(self.blocks) - self.config.dense_layers)
-        # average aux over MoE layers
-        aux_out = {}
-        for k, v in aux_all.items():
-            aux_out[k] = v / n_moe
+        # scan stacks each MoE layer's aux on a leading axis; average over layers
+        n_moe = max(1, self.n_moe)
+        aux_out = {k: jnp.sum(v, axis=0) / n_moe for k, v in aux_stacked.items()}
         return logits, aux_out
 
     def generate(self, tokens, positions=None):

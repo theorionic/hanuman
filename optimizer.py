@@ -87,21 +87,32 @@ def build_no_decay_mask(state):
     return mask
 
 
-def _custom_weight_decay(wd: float, mask_tree):
-    """Custom weight decay transform that subtracts `wd * param` for masked
-    (True) leaves. Works with nnx State/Param custom pytree nodes, unlike
-    optax's built-in `mask` which breaks on Param custom nodes.
+def _custom_weight_decay(wd: float, mask_tree, schedule: optax.Schedule):
+    """Decoupled (AdamW-style) weight decay for masked (True) leaves.
+
+    Works with nnx State/Param custom pytree nodes, unlike optax's built-in
+    `mask` which breaks on Param custom nodes.
+
+    The decay must be scaled by the current learning rate. This transform runs
+    *after* `optax.lion`, which has already multiplied its update by lr, so an
+    unscaled `u - wd * p` would be a full-magnitude step: at the configured
+    wd=1.0 the update becomes `lion_update - p`, and `p + update` collapses
+    every decayed parameter to ~0 on the very first step. Tracking the step
+    count here lets us apply `lr(t) * wd * p` to match optax's convention.
     """
     def init_fn(params):
-        return optax.EmptyState()
+        return {"count": jnp.zeros([], jnp.int32)}
 
     def update_fn(updates, state, params=None):
+        lr = schedule(state["count"])
+
         def f(u, m, p):
             if m and p is not None:
-                return u - wd * p
+                return u - lr * wd * p
             return u
+
         new_updates = jax.tree_util.tree_map(f, updates, mask_tree, params)
-        return new_updates, state
+        return new_updates, {"count": optax.safe_increment(state["count"])}
 
     return optax.GradientTransformation(init_fn, update_fn)
 
@@ -127,6 +138,6 @@ def build_optimizer(config, state):
             b1=0.9,
             b2=0.99,
         ),
-        _custom_weight_decay(config.weight_decay, mask),
+        _custom_weight_decay(config.weight_decay, mask, schedule),
     )
     return opt, schedule

@@ -53,6 +53,17 @@ def expert_shard_axis(n_experts: int, mesh: Mesh):
     return None
 
 
+def _leaf_name(name: str) -> str:
+    """Last meaningful path component, ignoring nnx's '.value' leaf marker.
+
+    nnx paths end in a '.value' element (e.g. 'rope_cos/.value'), so taking the
+    final component naively yields '.value' for every leaf and any name-based
+    rule silently never matches.
+    """
+    parts = [p for p in name.split("/") if p not in (".value", "value", "raw_value")]
+    return parts[-1] if parts else name
+
+
 def param_spec(name: str, shape, mesh: Mesh) -> P:
     """FSDP PartitionSpec for one parameter.
 
@@ -70,9 +81,14 @@ def param_spec(name: str, shape, mesh: Mesh) -> P:
     """
     d = mesh.shape["data"]
     e = mesh.shape["expert"]
-    base = name.rsplit("/", 1)[-1] if "/" in name else name
+    base = _leaf_name(name)
 
-    if not shape or base in ("cos", "sin"):
+    # The RoPE tables are indexed by position, so their long axis is *sequence*.
+    # The generic "shard the largest divisible axis" rule below would split them
+    # across devices, and GSPMD then propagates that sequence sharding into q
+    # and k -- costing an all-gather of cos and sin inside every layer of the
+    # scan, in the forward, the remat recompute, and the backward alike.
+    if not shape or base in ("cos", "sin", "rope_cos", "rope_sin"):
         return P()
     if int(np.prod(shape)) < _REPLICATE_BELOW:
         return P()

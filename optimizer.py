@@ -131,12 +131,19 @@ def build_optimizer(config, state):
         decay_fraction=config.decay_fraction,
     )
     mask = build_no_decay_mask(state)
+    # Lion's momentum in bf16 halves the optimizer state (3.15 GB -> 1.57 GB per
+    # device for the 7B config). Lion only ever takes the *sign* of the
+    # interpolation between momentum and gradient, so the low mantissa costs it
+    # far less than it would a magnitude-based optimizer like Adam.
+    mu_dtype = {"bf16": jnp.bfloat16, "fp32": jnp.float32}[
+        getattr(config, "opt_state_dtype", "bf16")]
     opt = optax.chain(
         optax.clip_by_global_norm(config.grad_clip),
         optax.lion(
             learning_rate=schedule,
             b1=0.9,
             b2=0.99,
+            mu_dtype=mu_dtype,
         ),
         _custom_weight_decay(config.weight_decay, mask, schedule),
     )

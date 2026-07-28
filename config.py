@@ -58,10 +58,23 @@ class Config:
     dtype: str = "bf16"              # compute dtype
     master_dtype: str = "fp32"       # master weights
     remat: bool = True               # rematerialize each block in the backward pass
+    # Which intermediates survive into the backward pass. See model.transformer.
+    # remat_policy: 'full' | 'dots' | 'dots_no_batch' | 'experts' | 'none'
+    # Measured on the 7B config, fwd+bwd: full 2472 ms / dots 1036 ms /
+    # dots_no_batch 1021 ms. 'experts' saves too much and runs out of HBM.
+    remat_policy: str = "dots_no_batch"
+    fused_step: bool = True          # backward + optimizer in one jit
+    opt_state_dtype: str = "bf16"    # Lion momentum dtype ('bf16' halves opt state)
 
     # ---- Data ----
     dataset: str = "openbmb/Ultra-FineWeb-L3"
     dataset_config: Optional[str] = "Ultra-FineWeb-L3-en-Multi-Style-Synthetic"
+    # Direct parquet glob. Set this and dataset_config is bypassed -- resolving
+    # the named config against this repo's 1771 files takes minutes, the glob
+    # takes ~2s. Set to None to go back through the config machinery.
+    dataset_files: Optional[str] = (
+        "hf://datasets/openbmb/Ultra-FineWeb-L3/"
+        "data/ultrafineweb_en_l3/multi_style/*.parquet")
     tokenizer: str = "byte"          # 'byte' | 'llama3' | path
     pack_eos_id: Optional[int] = None
 

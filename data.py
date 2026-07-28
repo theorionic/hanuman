@@ -1,14 +1,28 @@
-"""Data loading: Ultra-FineWeb-L3 streaming, tokenization, packing to seq_len."""
+"""Data loading: Ultra-FineWeb-L3 streaming, tokenization, packing to seq_len.
+
+Everything up to the final `device_put` stays in numpy on the host. Batches are
+built on a background thread so tokenization overlaps the TPU step instead of
+blocking it -- a synchronous pipeline left the accelerator idle for minutes
+before the first step of a real-data run.
+"""
 from __future__ import annotations
 
 import itertools
+import os
+import queue
+import threading
 from typing import Iterator, Optional
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 
 from config import Config
+
+# The fast (Rust) tokenizers parallelize across a batch of documents; without
+# this they warn and fall back to one thread when used from a worker thread.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+
+_DOC_CHUNK = 256   # documents handed to the tokenizer at once
+_PREFETCH = 8      # batches kept ready ahead of the training loop
 
 
 class ByteTokenizer:
@@ -56,16 +70,53 @@ def get_tokenizer(config: Config):
             return ByteTokenizer(vocab_size=config.vocab_size)
 
 
+def encode_documents(tokenizer, texts: list[str]) -> list[list[int]]:
+    """Tokenize many documents in one call.
+
+    HF fast tokenizers release the GIL and parallelize over the batch, so one
+    batched call is several times faster than a Python loop over `encode`.
+    """
+    if isinstance(tokenizer, ByteTokenizer):
+        return [tokenizer.encode(t) for t in texts]
+    return tokenizer(texts, add_special_tokens=False)["input_ids"]
+
+
+# Field holding the document body, most specific first. Ultra-FineWeb-L3 uses
+# 'content'; most other corpora use 'text'. Guessing wrong is silent and fatal:
+# every record reads as empty, the packer never fills a sequence, and the loop
+# spins forever without producing a batch.
+_TEXT_FIELDS = ("content", "text", "raw_content", "document")
+
+
+def _open_stream(config: Config):
+    """Open the dataset as a streaming iterable.
+
+    Prefers an explicit parquet glob. Resolving a named config on a repo this
+    size means listing and matching all 1771 files through the datasets config
+    machinery, which takes minutes; pointing at the parquet files directly takes
+    ~2 s for the same data.
+    """
+    from datasets import load_dataset
+
+    files = getattr(config, "dataset_files", None)
+    if files:
+        return load_dataset("parquet", data_files=files, split="train", streaming=True)
+    return load_dataset(config.dataset, getattr(config, "dataset_config", None),
+                        split="train", streaming=True)
+
+
 def stream_dataset(config: Config) -> Iterator[str]:
     """Stream text from Ultra-FineWeb-L3 (or fall back to synthetic data)."""
     try:
-        from datasets import load_dataset
-        # Ultra-FineWeb-L3 has no default config; a name must be given.
-        ds = load_dataset(config.dataset, getattr(config, "dataset_config", None),
-                          split="train", streaming=True)
+        ds = _open_stream(config)
+        field = None
         for ex in ds:
-            # Ultra-FineWeb-L3 has a 'text' field
-            text = ex.get("text", "")
+            if field is None:
+                field = next((f for f in _TEXT_FIELDS if ex.get(f)), None)
+                if field is None:
+                    raise KeyError(f"no text field in record; keys={list(ex)}")
+                print(f"[data] Streaming field {field!r}")
+            text = ex.get(field, "")
             if text:
                 yield text
     except Exception as e:
@@ -80,20 +131,50 @@ def stream_dataset(config: Config) -> Iterator[str]:
             i += 1
 
 
-def pack_sequences(token_iter: Iterator[list[int]], seq_len: int, eos_id: int) -> Iterator[jnp.ndarray]:
+def pack_sequences(token_iter: Iterator[list[int]], seq_len: int, eos_id: int) -> Iterator[np.ndarray]:
     """Pack token lists into fixed-length sequences with EOS between docs."""
-    buf = []
+    buf: list[int] = []
     for tokens in token_iter:
         buf.extend(tokens)
         buf.append(eos_id)
         while len(buf) >= seq_len:
             chunk = buf[:seq_len]
-            buf = buf[seq_len:]
-            yield jnp.array(chunk, dtype=jnp.int32)
+            del buf[:seq_len]
+            yield np.asarray(chunk, dtype=np.int32)
 
 
-def make_batches(config: Config, batch_size: int, seq_len: int, tokenizer=None) -> Iterator[jnp.ndarray]:
-    """Yield batches of shape [batch_size, seq_len]."""
+def prefetch(it: Iterator, depth: int = _PREFETCH) -> Iterator:
+    """Run `it` on a background thread, buffering up to `depth` items.
+
+    Tokenization is host work with nothing to do with the accelerator, so
+    overlapping it with the step is free throughput. The queue is bounded, so a
+    fast consumer applies backpressure rather than letting the producer run away
+    with host memory.
+    """
+    q: queue.Queue = queue.Queue(maxsize=depth)
+    sentinel = object()
+
+    def worker():
+        try:
+            for item in it:
+                q.put(item)
+        except Exception as e:                # surface producer errors downstream
+            q.put(e)
+        finally:
+            q.put(sentinel)
+
+    threading.Thread(target=worker, daemon=True).start()
+    while True:
+        item = q.get()
+        if item is sentinel:
+            return
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+
+def make_batches(config: Config, batch_size: int, seq_len: int, tokenizer=None) -> Iterator[np.ndarray]:
+    """Yield batches of shape [batch_size, seq_len] as host numpy arrays."""
     if tokenizer is None:
         tokenizer = get_tokenizer(config)
     eos = getattr(tokenizer, "eos_id", None)
@@ -103,19 +184,26 @@ def make_batches(config: Config, batch_size: int, seq_len: int, tokenizer=None) 
         eos = config.vocab_size - 1
 
     def token_iter():
-        for text in stream_dataset(config):
-            yield tokenizer.encode(text)
+        docs = stream_dataset(config)
+        while True:
+            chunk = list(itertools.islice(docs, _DOC_CHUNK))
+            if not chunk:
+                return
+            yield from encode_documents(tokenizer, chunk)
 
-    packed = pack_sequences(token_iter(), seq_len, eos)
-    while True:
-        batch = list(itertools.islice(packed, batch_size))
-        if len(batch) < batch_size:
-            break
-        yield jnp.stack(batch)
+    def batches():
+        packed = pack_sequences(token_iter(), seq_len, eos)
+        while True:
+            batch = list(itertools.islice(packed, batch_size))
+            if len(batch) < batch_size:
+                return
+            yield np.stack(batch)
+
+    return prefetch(batches())
 
 
-def random_batches(config: Config, batch_size: int, seq_len: int, seed: int = 0) -> Iterator[jnp.ndarray]:
+def random_batches(config: Config, batch_size: int, seq_len: int, seed: int = 0) -> Iterator[np.ndarray]:
     """Yield random token batches (for smoke test / no-data mode)."""
     rng = np.random.default_rng(seed)
     while True:
-        yield jnp.array(rng.integers(0, config.vocab_size, size=(batch_size, seq_len)), dtype=jnp.int32)
+        yield rng.integers(0, config.vocab_size, size=(batch_size, seq_len), dtype=np.int32)

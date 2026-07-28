@@ -35,7 +35,7 @@ class Block(nnx.Module):
                  norm_eps: float, residual_scale_init: float,
                  use_moe: bool, dtype, rngs: nnx.Rngs, mesh=None):
         self.norm1 = RMSNorm(d_model, norm_eps, dtype)
-        self.attn = Attention(d_model, n_q_heads, n_kv_heads, head_dim, dtype, rngs)
+        self.attn = Attention(d_model, n_q_heads, n_kv_heads, head_dim, dtype, rngs, mesh=mesh)
         self.norm2 = RMSNorm(d_model, norm_eps, dtype)
         if use_moe:
             self.ffn = MoE(d_model, d_ff, n_experts, n_active, n_shared_experts,
@@ -63,6 +63,27 @@ class Block(nnx.Module):
             return x, {}
 
 
+def remat_policy(name: str):
+    """Map a config string to a `jax.checkpoint` policy.
+
+    Which intermediates are kept for the backward pass is the single biggest
+    throughput knob in this model. `full` (save nothing, recompute everything)
+    is the textbook choice, but it measures at ~76 ms per MoE layer against an
+    11 ms forward: the recompute drags the expert-weight all-gather and the
+    routing sort onto the backward's critical path, where there is no other
+    work to overlap them with. Saving just the grouped-matmul outputs removes
+    most of that while keeping the big [T*K, D] tensors out of HBM.
+    """
+    p = jax.checkpoint_policies
+    return {
+        "none": None,                                   # no remat at all
+        "full": p.nothing_saveable,                     # recompute everything
+        "dots": p.checkpoint_dots,                      # keep every matmul output
+        "dots_no_batch": p.checkpoint_dots_with_no_batch_dims,
+        "experts": p.save_only_these_names("moe_gate", "moe_up", "moe_out"),
+    }[name]
+
+
 class BlockStack(nnx.Module):
     """`n` structurally identical blocks with their params stacked on axis 0.
 
@@ -73,7 +94,7 @@ class BlockStack(nnx.Module):
     host RAM to optimize.
     """
 
-    def __init__(self, n: int, make_block, remat: bool):
+    def __init__(self, n: int, make_block, remat: bool, policy: str = "full"):
         blocks = [make_block() for _ in range(n)]
         graphdefs, states = zip(*[nnx.split(b) for b in blocks])
         # Same structure for every block, so stacking leaf-by-leaf gives one
@@ -82,6 +103,7 @@ class BlockStack(nnx.Module):
         self.blocks = nnx.merge(graphdefs[0], stacked)
         self.n = n
         self.remat = remat
+        self.policy = policy
 
     def __call__(self, x, cos, sin, positions=None):
         graphdef, state = nnx.split(self.blocks)
@@ -90,9 +112,8 @@ class BlockStack(nnx.Module):
             block = nnx.merge(graphdef, layer_state)
             return block(carry, cos, sin, positions=positions)
 
-        # Remat per scan iteration: only the layer boundary activation is kept
-        # for the backward pass, everything inside the block is recomputed.
-        f = jax.checkpoint(body) if self.remat else body
+        pol = remat_policy(self.policy) if self.remat else None
+        f = body if (not self.remat or self.policy == "none") else jax.checkpoint(body, policy=pol)
         x, aux = jax.lax.scan(f, x, state)
         return x, aux
 
@@ -142,10 +163,13 @@ class Transformer(nnx.Module):
             )
 
         remat = getattr(config, "remat", True)
+        policy = getattr(config, "remat_policy", "full")
         self.n_dense = config.dense_layers
         self.n_moe = config.layers - config.dense_layers
-        self.dense_stack = BlockStack(self.n_dense, make_block(False), remat) if self.n_dense else None
-        self.moe_stack = BlockStack(self.n_moe, make_block(True), remat) if self.n_moe else None
+        self.dense_stack = (BlockStack(self.n_dense, make_block(False), remat, policy)
+                            if self.n_dense else None)
+        self.moe_stack = (BlockStack(self.n_moe, make_block(True), remat, policy)
+                          if self.n_moe else None)
 
         self.norm_f = RMSNorm(config.d_model, config.norm_eps, dtype)
 

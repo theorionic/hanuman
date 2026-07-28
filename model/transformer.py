@@ -191,9 +191,12 @@ class Transformer(nnx.Module):
         x = self.norm_f(x)
         # tied output projection: logits = x @ wte.T
         logits = x @ self.wte.T.astype(jnp.float32)  # [B, S, vocab]
-        # scan stacks each MoE layer's aux on a leading axis; average over layers
+        # scan stacks each MoE layer's aux on a leading axis. Scalars (the
+        # losses, the entropy) average over layers; expert_counts stays
+        # [n_moe, n_experts] because each layer's router is balanced separately.
         n_moe = max(1, self.n_moe)
-        aux_out = {k: jnp.sum(v, axis=0) / n_moe for k, v in aux_stacked.items()}
+        aux_out = {k: (v if k == "expert_counts" else jnp.sum(v, axis=0) / n_moe)
+                   for k, v in aux_stacked.items()}
         return logits, aux_out
 
     def generate(self, tokens, positions=None):

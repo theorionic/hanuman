@@ -142,9 +142,23 @@ def loss_fn(graphdef, params, rest, tokens, config: Config):
     z_loss = config.z_loss_weight * aux.get("router_z_loss", 0.0)
     bal_loss = config.balance_loss_weight * aux.get("balance_loss", 0.0)
     total = ce_loss + z_loss + bal_loss
+
+    n_moe = max(1, config.layers - config.dense_layers)
+    counts = aux.get("expert_counts", jnp.zeros((n_moe, config.n_experts)))
+    # Effective number of experts carrying load, exp(H) of the per-layer load
+    # distribution: n_experts when perfectly balanced, k when only k experts see
+    # traffic. Deliberately not max/mean -- top-k gives each expert at most one
+    # slot per token, so max/mean is capped at n_experts/n_active and pins to
+    # that ceiling as soon as any single expert becomes universally popular,
+    # staying there no matter how much worse the rest of the distribution gets.
+    share = counts / (jnp.sum(counts, axis=-1, keepdims=True) + 1e-9)
+    load_entropy = -jnp.sum(share * jnp.log(share + 1e-9), axis=-1)  # [n_moe]
+    eff_experts = jnp.mean(jnp.exp(load_entropy))
+
     return total, {"ce": ce_loss, "z_loss": z_loss, "bal_loss": bal_loss,
                    "mean_entropy": aux.get("mean_entropy", 0.0),
-                   "expert_counts": aux.get("expert_counts", jnp.zeros(config.n_experts))}
+                   "eff_experts": eff_experts,
+                   "expert_counts": counts}
 
 
 def make_train_step(graphdef, config: Config, opt: optax.GradientTransformation,
@@ -178,7 +192,15 @@ def make_train_step(graphdef, config: Config, opt: optax.GradientTransformation,
         # by a fixed step in the direction that evens out load. The update is
         # sign-based on purpose -- raw (count - mean) is in units of tokens
         # (thousands), which would instantly swamp the sigmoid scores in (0,1).
-        delta = config.bias_update_rate * jnp.sign(counts - jnp.mean(counts))
+        #
+        # `counts` is [n_moe, n_experts] and the comparison is against each
+        # layer's own mean. Reducing it to a single [n_experts] vector first
+        # (which is what averaging the aux across layers used to do) makes
+        # per-layer collapse invisible: one layer overloading experts 0-7 and
+        # another overloading 20-27 average out to a flat, healthy-looking
+        # histogram, and neither layer ever gets corrected.
+        layer_mean = jnp.mean(counts, axis=-1, keepdims=True)
+        delta = config.bias_update_rate * jnp.sign(counts - layer_mean)
         return _update_biases(new_params, delta, config), new_opt_state
 
     # Donate params + opt_state: they are ~2/3 of HBM and are dead after the
@@ -409,6 +431,7 @@ def train(config: Config, use_random_data: bool = True, save: bool = True):
             print(f"  step {step:5d} | loss {float(loss):.4f} | ce {float(metrics['ce']):.4f} "
                   f"| z {float(metrics['z_loss']):.6f} | bal {float(metrics['bal_loss']):.6f} "
                   f"| ent {float(metrics['mean_entropy']):.3f} "
+                  f"| experts {float(metrics['eff_experts']):.1f}/{config.n_experts} "
                   f"| lr {float(schedule(step)):.2e} | {sec*1e3:.0f} ms/step "
                   f"| tok/s {tps:,.0f}{mfu}")
             t_win, steps_win = time.time(), 0

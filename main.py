@@ -37,6 +37,19 @@ if os.environ.get("HANUMAN_NO_TPU_FLAGS") != "1":
         os.environ.get("LIBTPU_INIT_ARGS", "") + " " + " ".join(_TPU_FLAGS)
     ).strip()
 
+# Persistent XLA compilation cache. The 7B step takes ~50 s to compile, which
+# is paid again on every process start -- and dominates short runs and config
+# sweeps, where the compiled program is usually identical. The cache key covers
+# the HLO, so a genuine shape/config change still recompiles.
+_CACHE_DIR = os.environ.get("HANUMAN_CACHE_DIR",
+                            os.path.expanduser("~/.cache/hanuman-jax"))
+if _CACHE_DIR and _CACHE_DIR != "off":
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", _CACHE_DIR)
+    # Defaults skip small/fast entries; we want the big step function cached.
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "-1")
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "1.0")
+
 
 def cmd_train(args):
     from config import get_config
@@ -60,6 +73,12 @@ def cmd_train(args):
         config.d_ff_dense = args.d_ff_dense
     if args.n_active is not None:
         config.n_active = args.n_active
+    if args.z_weight is not None:
+        config.z_loss_weight = args.z_weight
+    if args.bias_rate is not None:
+        config.bias_update_rate = args.bias_rate
+    if args.balance_weight is not None:
+        config.balance_loss_weight = args.balance_weight
     if args.warmup is not None:
         config.warmup_steps = args.warmup
     if args.lr is not None:
@@ -124,6 +143,12 @@ def main():
     p_train.add_argument("--d_ff_dense", type=int, default=None,
                          help="Shared-expert / dense-layer FFN width (default: same as --d_ff)")
     p_train.add_argument("--n_active", type=int, default=None, help="Top-k routed experts")
+    p_train.add_argument("--z_weight", type=float, default=None,
+                         help="Router z-loss weight")
+    p_train.add_argument("--bias_rate", type=float, default=None,
+                         help="Router-bias load-balancing step (DeepSeek gamma)")
+    p_train.add_argument("--balance_weight", type=float, default=None,
+                         help="Weight on the sequence-wise balance loss")
     p_train.add_argument("--warmup", type=int, default=None, help="Warmup steps")
     p_train.add_argument("--lr", type=float, default=None, help="Peak learning rate")
     p_train.add_argument("--remat_policy", default=None,

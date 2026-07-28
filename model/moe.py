@@ -254,22 +254,34 @@ class MoE(nnx.Module):
         lse = jax.nn.logsumexp(gate_logits, axis=-1)  # [B, S]
         router_z_loss = jnp.mean(lse ** 2)
 
-        # balance loss: sequence-wise fraction of tokens routed to each expert.
+        # Sequence-wise fraction of (token, slot) pairs landing on each expert.
         # A bincount per sequence gives the same [B, N] histogram as summing a
         # one-hot, without materializing the [B, S, K, N] tensor.
         counts = jax.vmap(lambda t: jnp.bincount(t.reshape(-1), length=N))(top_idx)
         counts = counts.astype(jnp.float32)  # [B, N]
-        fractions = counts / (S * K)  # [B, N] fraction of (token,slot) pairs per expert
-        # balance loss = N * sum(f_i^2) averaged over batch
-        balance_loss = N * jnp.sum(fractions ** 2, axis=-1)  # [B]
-        balance_loss = jnp.mean(balance_loss)
+        fractions = counts / (S * K)  # [B, N]
+
+        # Normalized routing distribution, used for both the balance loss and
+        # the entropy diagnostic.
+        probs = scores / (jnp.sum(scores, axis=-1, keepdims=True) + 1e-9)  # [B, S, N]
+
+        # DeepSeek-V3 complementary sequence-wise balance loss:
+        #     L = N * sum_i f_i * P_i
+        # where f_i is the (non-differentiable) dispatch fraction and P_i is the
+        # mean routing probability. The f_i * P_i product is what makes this
+        # trainable: f_i comes from a top-k index and carries no gradient, so the
+        # earlier `N * sum(f_i^2)` form had zero gradient everywhere and was a
+        # diagnostic masquerading as a loss. Equals 1.0 at perfect balance.
+        mean_probs = jnp.mean(probs, axis=1)  # [B, N]
+        balance_loss = jnp.mean(N * jnp.sum(fractions * mean_probs, axis=-1))
 
         # mean entropy of routing distribution (for logging; lower = more concentrated)
-        probs = scores / (jnp.sum(scores, axis=-1, keepdims=True) + 1e-9)
         entropy = -jnp.sum(probs * jnp.log(probs + 1e-9), axis=-1)  # [B, S]
         mean_entropy = jnp.mean(entropy)
 
-        # expert counts for bias update (sum over batch+seq) [N]
+        # Expert load for this layer's bias update, summed over the batch. Kept
+        # per-layer all the way to the optimizer: every MoE layer has its own
+        # router and its own imbalance, and averaging them together hides it.
         expert_counts = jnp.sum(counts, axis=0)  # [N]
 
         aux = {

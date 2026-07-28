@@ -37,9 +37,10 @@ def count_active_params(config: Config) -> int:
     # norms: 2 per block + final
     norms = 2 * D + D
     # dense FFN (SwiGLU: 3 matrices)
-    dense_ffn = 3 * D * dff
+    dffd = getattr(config, "d_ff_dense", None) or dff
+    dense_ffn = 3 * D * dffd
     # MoE active: n_active routed experts (3 matrices each) + shared (3 matrices)
-    moe_active = config.n_active * 3 * D * dff + config.n_shared_experts * 3 * D * dff
+    moe_active = config.n_active * 3 * D * dff + config.n_shared_experts * 3 * D * dffd
     # router (active in compute)
     router = D * config.n_experts
     # residual scales: one per block
@@ -58,8 +59,9 @@ def count_total_params(config: Config) -> int:
     emb = config.vocab_size * D
     qkv = D * (config.n_q_heads * config.head_dim) + 2 * D * (config.n_kv_heads * config.head_dim)
     attn = qkv + (config.n_q_heads * config.head_dim) * D
-    dense_ffn = 3 * D * dff
-    moe_total = config.n_experts * 3 * D * dff + config.n_shared_experts * 3 * D * dff
+    dffd = getattr(config, "d_ff_dense", None) or dff
+    dense_ffn = 3 * D * dffd
+    moe_total = config.n_experts * 3 * D * dff + config.n_shared_experts * 3 * D * dffd
     router = D * config.n_experts
     bias = config.n_experts
     norms = 2 * D + D
@@ -91,8 +93,10 @@ def step_flops(config: Config) -> tuple[int, int]:
     core = 2 * Nq * H * S
     attn = proj + core
 
-    dense_ffn = 2 * 3 * D * dff
-    moe_ffn = 2 * 3 * D * dff * (config.n_active + config.n_shared_experts)
+    dffd = getattr(config, "d_ff_dense", None) or dff
+    dense_ffn = 2 * 3 * D * dffd
+    # Routed experts use d_ff; the always-on shared expert uses d_ff_dense.
+    moe_ffn = 2 * 3 * D * (dff * config.n_active + dffd * config.n_shared_experts)
     router = 2 * D * config.n_experts
     head = 2 * D * config.vocab_size
 

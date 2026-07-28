@@ -23,7 +23,11 @@ class Config:
     n_experts: int = 4          # routed experts
     n_active: int = 2           # top-k routed experts
     n_shared_experts: int = 1   # always-on shared expert(s)
-    d_ff: int = 128             # per-expert FFN hidden (SwiGLU intermediate)
+    d_ff: int = 128             # per-routed-expert FFN hidden (SwiGLU intermediate)
+    # Width of the always-on paths: the shared expert and the dense-layer FFN.
+    # None means "same as d_ff". Separating them lets routed-expert granularity
+    # be changed without also resizing every dense matmul in the model.
+    d_ff_dense: Optional[int] = None
     dense_layers: int = 1       # first N layers use dense FFN instead of MoE
 
     # ---- Norm ----

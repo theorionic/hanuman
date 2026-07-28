@@ -52,6 +52,14 @@ def cmd_train(args):
         config.remat = args.remat
     if args.remat_policy is not None:
         config.remat_policy = args.remat_policy
+    if args.experts is not None:
+        config.n_experts = args.experts
+    if args.d_ff is not None:
+        config.d_ff = args.d_ff
+    if args.d_ff_dense is not None:
+        config.d_ff_dense = args.d_ff_dense
+    if args.n_active is not None:
+        config.n_active = args.n_active
     if args.warmup is not None:
         config.warmup_steps = args.warmup
     if args.lr is not None:
@@ -111,6 +119,11 @@ def main():
     p_train.add_argument("--seq_len", type=int, default=None)
     p_train.add_argument("--random_data", action="store_true", help="Force random data")
     p_train.add_argument("--no_save", action="store_true", help="Skip the final checkpoint")
+    p_train.add_argument("--experts", type=int, default=None, help="Routed experts per MoE layer")
+    p_train.add_argument("--d_ff", type=int, default=None, help="Per-routed-expert SwiGLU hidden size")
+    p_train.add_argument("--d_ff_dense", type=int, default=None,
+                         help="Shared-expert / dense-layer FFN width (default: same as --d_ff)")
+    p_train.add_argument("--n_active", type=int, default=None, help="Top-k routed experts")
     p_train.add_argument("--warmup", type=int, default=None, help="Warmup steps")
     p_train.add_argument("--lr", type=float, default=None, help="Peak learning rate")
     p_train.add_argument("--remat_policy", default=None,

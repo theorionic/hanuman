@@ -124,7 +124,7 @@ class MoE(nnx.Module):
 
     def __init__(self, d_model: int, d_ff: int, n_experts: int, n_active: int,
                  n_shared_experts: int, router_init_std: float, routed_scaling_factor: float,
-                 dtype, rngs: nnx.Rngs, mesh=None):
+                 dtype, rngs: nnx.Rngs, mesh=None, d_ff_shared: int | None = None):
         self.mesh = mesh
         self.expert_axis_name = expert_shard_axis(n_experts, mesh) if mesh is not None else None
         self.n_experts = n_experts
@@ -145,15 +145,17 @@ class MoE(nnx.Module):
         self.expert_w_up = nnx.Param(jax.random.normal(rngs.params(), (n_experts, d_model, d_ff)) * std)
         self.expert_w_down = nnx.Param(jax.random.normal(rngs.params(), (n_experts, d_ff, d_model)) * std)
 
-        # Shared expert(s)
+        # Shared expert(s). Width is independent of the routed experts' d_ff so
+        # that expert granularity can be varied on its own.
+        dfs = d_ff if d_ff_shared is None else d_ff_shared
         if n_shared_experts == 1:
-            self.shared_w_gate = nnx.Param(jax.random.normal(rngs.params(), (d_model, d_ff)) * std)
-            self.shared_w_up = nnx.Param(jax.random.normal(rngs.params(), (d_model, d_ff)) * std)
-            self.shared_w_down = nnx.Param(jax.random.normal(rngs.params(), (d_ff, d_model)) * std)
+            self.shared_w_gate = nnx.Param(jax.random.normal(rngs.params(), (d_model, dfs)) * std)
+            self.shared_w_up = nnx.Param(jax.random.normal(rngs.params(), (d_model, dfs)) * std)
+            self.shared_w_down = nnx.Param(jax.random.normal(rngs.params(), (dfs, d_model)) * std)
         else:
-            self.shared_w_gate = nnx.Param(jax.random.normal(rngs.params(), (n_shared_experts, d_model, d_ff)) * std)
-            self.shared_w_up = nnx.Param(jax.random.normal(rngs.params(), (n_shared_experts, d_model, d_ff)) * std)
-            self.shared_w_down = nnx.Param(jax.random.normal(rngs.params(), (n_shared_experts, d_ff, d_model)) * std)
+            self.shared_w_gate = nnx.Param(jax.random.normal(rngs.params(), (n_shared_experts, d_model, dfs)) * std)
+            self.shared_w_up = nnx.Param(jax.random.normal(rngs.params(), (n_shared_experts, d_model, dfs)) * std)
+            self.shared_w_down = nnx.Param(jax.random.normal(rngs.params(), (n_shared_experts, dfs, d_model)) * std)
 
     def _shared_ffn(self, x):
         if self.n_shared_experts == 1:

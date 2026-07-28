@@ -31,6 +31,7 @@ class Block(nnx.Module):
 
     def __init__(self, d_model: int, n_q_heads: int, n_kv_heads: int, head_dim: int,
                  d_ff: int, n_experts: int, n_active: int, n_shared_experts: int,
+                 d_ff_dense: int,
                  router_init_std: float, routed_scaling_factor: float,
                  norm_eps: float, residual_scale_init: float,
                  use_moe: bool, dtype, rngs: nnx.Rngs, mesh=None):
@@ -39,9 +40,10 @@ class Block(nnx.Module):
         self.norm2 = RMSNorm(d_model, norm_eps, dtype)
         if use_moe:
             self.ffn = MoE(d_model, d_ff, n_experts, n_active, n_shared_experts,
-                           router_init_std, routed_scaling_factor, dtype, rngs, mesh=mesh)
+                           router_init_std, routed_scaling_factor, dtype, rngs,
+                           mesh=mesh, d_ff_shared=d_ff_dense)
         else:
-            self.ffn = DenseFFN(d_model, d_ff, dtype, rngs)
+            self.ffn = DenseFFN(d_model, d_ff_dense, dtype, rngs)
         self.use_moe = use_moe
         # residual scale (DeepSeek-style learnable scalar, init 1.0)
         self.residual_scale = nnx.Param(jnp.array(residual_scale_init, dtype=jnp.float32))
@@ -149,6 +151,8 @@ class Transformer(nnx.Module):
                 n_kv_heads=config.n_kv_heads,
                 head_dim=config.head_dim,
                 d_ff=config.d_ff,
+                d_ff_dense=(config.d_ff if getattr(config, "d_ff_dense", None) is None
+                            else config.d_ff_dense),
                 n_experts=config.n_experts,
                 n_active=config.n_active,
                 n_shared_experts=config.n_shared_experts,

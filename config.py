@@ -88,6 +88,42 @@ class Config:
     checkpoint_every: int = 0        # 0 = only at end
     checkpoint_dir: str = "checkpoints"
 
+    # ---- Sliding window attention (SWA) hybrid ----
+    # When use_swa=True, layers alternate between local (sliding window)
+    # attention and full causal attention. This halves attention FLOPs at long
+    # context while keeping global context through the full-attention layers.
+    #   use_swa    : enable SWA hybrid mode
+    #   swa_window : number of tokens each SWA layer attends to (to the left,
+    #                plus itself). Must be >= 1.
+    #   swa_period : every Nth layer is full attention, the rest are SWA.
+    #                period=2 -> alternating (layer 0 SWA, layer 1 full, ...).
+    #                period=4 -> 3 SWA then 1 full (Mistral-style).
+    #                Layer i is full when (i % swa_period == swa_period - 1).
+    use_swa: bool = False
+    swa_window: int = 4096
+    swa_period: int = 2
+
+    # ---- Kimi Delta Attention (KDA) hybrid ----
+    # When use_kda=True, most layers use KDA (linear attention with the delta
+    # update rule, Kimi-Linear arXiv:2507.05927) and every kda_period-th layer
+    # is full causal attention. This is the Kimi-Linear pattern: 3 KDA : 1 full
+    # (kda_period=4). Layer i is "full" when (i % kda_period == kda_period-1),
+    # else "kda" -- the same convention as swa_period.
+    #   kda_heads     : number of KDA heads (can differ from n_q_heads)
+    #   kda_head_dim  : per-head dim for KDA layers (V=K)
+    #   kda_chunk_size: chunk size for the (future) chunked parallel form
+    #   use_scan      : when False, run layers in a plain Python loop instead of
+    #                   lax.scan. KDA and full-attention layers have different
+    #                   module structures, so a mixed stack cannot be scanned;
+    #                   we disable scan for the KDA hybrid. The scan was a
+    #                   compile-time optimization, irrelevant at smoke scale.
+    use_kda: bool = False
+    kda_period: int = 4
+    kda_heads: int = 64
+    kda_head_dim: int = 128
+    kda_chunk_size: int = 64
+    use_scan: bool = True
+
     # ---- Inference ----
     infer_seq_len: int = 32768
 
@@ -130,6 +166,22 @@ def smoke() -> Config:
         log_every=1,
         mesh_data_axis=1,
         mesh_expert_axis=1,
+        # Exercise the SWA code path on CPU. smoke seq_len=128, so a window of
+        # 64 means each SWA layer attends to 64 tokens (half the sequence) --
+        # small enough to actually constrain the window, large enough to train.
+        use_swa=True,
+        swa_window=64,
+        swa_period=2,
+        # Exercise the KDA code path on CPU. With 2 layers and kda_period=2:
+        # layer 0 = KDA, layer 1 = full attention. KDA heads/dim are tiny so
+        # the smoke test stays fast on CPU.
+        use_kda=True,
+        kda_period=2,
+        kda_heads=2,
+        kda_head_dim=32,
+        # KDA and full-attention layers have different module structures, so a
+        # mixed stack cannot be lax.scan'd. Disable scan for the KDA hybrid.
+        use_scan=False,
     )
 
 

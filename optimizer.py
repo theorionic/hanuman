@@ -58,6 +58,12 @@ def is_no_decay(name: str) -> bool:
     # RoPE tables (cos/sin) - not params anyway
     if "cos" in n or "sin" in n:
         return True
+    # KDA (Kimi Delta Attention) decay params: per-head A_log and per-channel
+    # dt_bias are log-space decay-rate parameters. Weight decay on them would
+    # pull the decay rate toward zero (i.e. toward no forgetting), which is
+    # not the intended inductive bias and can destabilize the recurrent state.
+    if "a_log" in n or "dt_bias" in n:
+        return True
     return False
 
 

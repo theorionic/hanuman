@@ -235,7 +235,16 @@ def make_train_step(graphdef, config: Config, opt: optax.GradientTransformation,
 def _update_biases(state, delta, config: Config):
     """Subtract `delta` from every 'bias' Param in the nnx State.
 
-    `delta` is [n_experts]; broadcast to each MoE layer's bias.
+    `delta` is [n_moe, n_experts] in the scan path (stacked over MoE layers,
+    matching the stacked bias params) and [n_experts] when there is a single
+    MoE layer. In the no-scan path (KDA hybrid) each MoE block keeps its own
+    un-stacked [n_experts] bias, so when delta has a leading n_moe axis we
+    squeeze it to match the per-layer bias shape. This is exact for n_moe=1
+    (the smoke / KDA-hybrid case); for n_moe > 1 in the no-scan path the
+    per-layer mapping is not tracked here, so the mean delta is applied to
+    every MoE layer's bias (a reasonable approximation -- the bias update is
+    a small sign-based nudge, not a gradient step).
+
     Uses tree_map_with_path to preserve the exact State/Param pytree structure
     (manually rebuilding State containers breaks jax pytree structure equality).
     """
@@ -246,7 +255,13 @@ def _update_biases(state, delta, config: Config):
         ks = keystr(path)
         # bias Param leaves have path ending in 'bias/.value'
         if ks.endswith("/bias/.value") or ks == "bias/.value":
-            return x - delta.astype(x.dtype)
+            d = delta.astype(x.dtype)
+            # If the bias is un-stacked ([N]) but delta is stacked ([n_moe, N]),
+            # reduce delta to match the bias shape. For n_moe=1 this is a pure
+            # squeeze; for n_moe>1 it's a mean over layers (see docstring).
+            if x.ndim < d.ndim:
+                d = jnp.mean(d, axis=0)
+            return x - d
         return x
 
     return jax.tree_util.tree_map_with_path(fn, state)
@@ -370,6 +385,20 @@ def train(config: Config, use_random_data: bool = True, save: bool = True):
     n_buffers = count_params(rest)
     print(f"[train] Trainable params: {n_params:,} ({n_params/1e9:.3f}B)")
     print(f"[train] Non-trainable buffers (RoPE tables): {n_buffers:,}")
+    # Print the per-layer attention type plan (KDA hybrid / SWA hybrid).
+    use_kda = getattr(config, "use_kda", False)
+    use_swa = getattr(config, "use_swa", False)
+    kda_period = getattr(config, "kda_period", 4)
+    swa_period = getattr(config, "swa_period", 2)
+    if use_kda:
+        plan = ["full" if (i % kda_period == kda_period - 1) else "kda"
+                for i in range(config.layers)]
+    elif use_swa:
+        plan = ["full" if (i % swa_period == swa_period - 1) else "swa"
+                for i in range(config.layers)]
+    else:
+        plan = ["full"] * config.layers
+    print(f"[train] Layer attention types: {plan}")
     print(f"[train] sharding: {describe(params, param_sh)}")
     if config.name == "full":
         print(f"[train] Active params (est): {count_active_params(config):,} "

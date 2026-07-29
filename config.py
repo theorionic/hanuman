@@ -265,7 +265,28 @@ def full() -> Config:
     )
 
 
-PRESETS = {"smoke": smoke, "smoke_kda": smoke_kda, "full": full}
+def full_g4() -> Config:
+    """Coarser-granularity variant of `full`: 40 experts x d_ff 1536, top-4.
+
+    Identical params (0.880B active) and FLOPs as full's 80 x 768 top-8, but it
+    halves the dispatch row count (T*K), which is the largest reclaimable piece
+    of the MoE step. Measured at 16K: 25.7% MFU / 45.5k tok/s vs full's 21.6% /
+    38.2k -- +19% throughput, +4 MFU, reproduced across runs.
+
+    This is a *modelling* change: top-4-of-40 is a coarser routing space than
+    top-8-of-80, so validate the loss curve before preferring it to `full`.
+    d_ff_dense is pinned to 768 so the shared/dense FFN width is unchanged.
+    """
+    c = full()
+    c.name = "full_g4"
+    c.n_experts = 40
+    c.n_active = 4
+    c.d_ff = 1536
+    c.d_ff_dense = 768
+    return c
+
+
+PRESETS = {"smoke": smoke, "smoke_kda": smoke_kda, "full": full, "full_g4": full_g4}
 
 
 def get_config(name: str) -> Config:

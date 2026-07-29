@@ -86,8 +86,20 @@ def _splash_kernel(seq_len: int, n_q_heads: int, window: int | None):
     trace leaks them (UnexpectedTracerError). Only the mask description above,
     which holds no arrays, is cached.
     """
-    block = min(512, seq_len)
-    kv_block = min(1024, seq_len)
+    # Tile sizes decide how dense the per-tile matmuls handed to the MXU are.
+    # Measured fwd+bwd for one layer at 1 sequence/chip, bf16, causal:
+    #
+    #   block_q/block_kv |  S=4096  | S=16384
+    #     256 / 512      |  3.44 ms | 46.25 ms
+    #     512 / 1024     |  2.24    | 26.62
+    #    1024 / 2048     |  2.38    | 24.55   <- 7.2% faster at 16384
+    #
+    # 512/1024 is optimal at 4096 and 1024/2048 at 16384, so scale with the
+    # sequence and cap: past 1024 the tiles stop fitting VMEM well and the win
+    # reverses (2048/2048 measured 25.07 ms).
+    block = min(1024, max(512, seq_len // 16))
+    block = min(block, seq_len)
+    kv_block = min(2 * block, seq_len)
     sizes = _spk.BlockSizes(
         block_q=block, block_kv=kv_block, block_kv_compute=block,
         block_q_dkv=block, block_kv_dkv=kv_block, block_kv_dkv_compute=block,

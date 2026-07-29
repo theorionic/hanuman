@@ -167,6 +167,29 @@ directly into the MXU tile inside the grouped matmul and never materializes
 `[T*K, D]` at all. It would attack the largest remaining time cost, the memory
 wall, and the context ceiling with one change.
 
+### Expert granularity is the cheapest large win
+
+Dispatch cost is proportional to `T*K`, and `K` can be traded against expert
+width at **constant parameter count and constant FLOPs**: 80 experts of d_ff 768
+with top-8 activates exactly as much as 40 experts of d_ff 1536 with top-4.
+Halving `K` halves every byte the dispatch moves. Measured at seq 16384,
+remat=full, with `d_ff_dense=768` pinned so the shared expert is untouched:
+
+| | params | active | TFLOP/step | ms/step | tok/s | MFU |
+|---|---|---|---|---|---|---|
+| 80 x 768, top-8 | 6.233B | 0.880B | 1168.8 | 3437 | 38,132 | 21.6% |
+| **40 x 1536, top-4** | 6.232B | 0.880B | 1167.8 | **2883** | **45,457** | **25.7%** |
+
+**+19% throughput and +4.1 points of MFU for a config change**, reproduced
+across two processes (2883/2884 ms). Nothing about the arithmetic changed --
+only how many times each token is copied.
+
+This is a *modelling* tradeoff, not a free win: fine-grained experts are the
+core claim of the DeepSeekMoE line, and top-4-of-40 is a coarser routing space
+than top-8-of-80. It needs a loss-curve comparison before adoption. It is also
+not enough on its own to move the memory wall -- batch 16 at 16384 still needs
+17.64 GB (was 18.86) against 15.75 GB available, and 32768 needs 19.57 GB.
+
 ### The expert weight-gradient is the fragile op
 
 XLA lowers the grouped weight-gradient (`dW = xs^T @ dy` per expert) not as a
@@ -355,17 +378,23 @@ size. The first two are the whole game.
 1. **Train at 16K context.** Free, already validated: 11.5% -> 21.2% MFU. It
    works precisely because the 230 ms reduce-scatter and the rest of the
    parameter-proportional communication are fixed per step.
-2. **The expert weight-gradient's masked-dense lowering** (82x declared FLOP
-   inflation; 24% of peak at best, 1.6% in the worst measured config). A Pallas
-   grouped-dW kernel is the fix. At 16384 this is 410 ms/step, 12%. Check first
-   whether a different `ragged_dot_general` dimension-numbers spelling gets XLA
-   to emit a real grouped dW -- that would be a far smaller change.
-3. **The dispatch permutation** -- 738 ms/step (21%) at 16384 of pure HBM
-   traffic, and the `[T*K, D]` buffer behind it is also what caps batch at 8 and
-   context at 16K. A fused Pallas dispatch kernel is the fix. (Not the sort:
-   that is 5.4 ms and nothing beats it.)
-4. **Expert parallelism**, to remove the 230 ms reduce-scatter. Details below.
-5. Merging the `gate`/`up` ragged_dots: +7.8% of that stage, ~1.8% of the step.
+2. **Expert granularity**: top-4-of-40 x d_ff 1536 instead of top-8-of-80 x
+   768 is +19% throughput at identical params and FLOPs (see above). Config
+   only. Needs a loss-curve check first -- it is a modelling change.
+3. **The expert weight-gradient's masked-dense lowering** (82x declared FLOP
+   inflation, 410 ms/step at 16384). NOT fixable by swapping in
+   `pallas.ops.tpu.megablox.gmm`: measured 0.79x even after tuning its tiling
+   to (512, 1536, 768), where its *forward* does match `ragged_dot`
+   (2.20 vs 2.12 ms, 71% vs 74% of peak) but its grouped backward loses. A
+   hand-written Pallas dW would have to beat XLA's masked-dense form, which
+   already reaches 58% of peak for the full fwd+bwd in isolation.
+4. **The dispatch permutation** -- 738 ms/step (21%) at 16384 of pure HBM
+   traffic, and the `[T*K, D]` buffer behind it is a large part of what caps
+   batch at 8 and context at 16K. A fused Pallas dispatch kernel that gathers
+   rows inside the grouped matmul is the fix, and it is the largest remaining
+   piece of work. (Not the sort: that is 5.4 ms and nothing beats it.)
+5. **Expert parallelism**, to remove the 230 ms reduce-scatter. Details below.
+6. Merging the `gate`/`up` ragged_dots: +7.8% of that stage, ~1.8% of the step.
 
 Not worth it, measured: non-expert weight sharding (1.4%, and the prototype
 NaN'd), batch size, every remat policy except the seq-length-dependent choice

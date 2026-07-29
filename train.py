@@ -471,17 +471,36 @@ def train(config: Config, use_random_data: bool = True, save: bool = True):
     print(f"[train] optimizer state ready ({count_params(opt_state)/1e9:.3f}B leaves)")
     print(f"[train] HBM after init: {hbm_report()}")
 
-    # Data
+    # Data. The Grain path yields batches already on-device (sharded); the
+    # numpy paths are device_put per step in the loop below.
     batch_sh = data_sharding(mesh)
     if use_random_data or config.tokenizer == "byte":
         data_iter = random_batches(config, config.batch_size, config.seq_len, seed=42)
         print("[train] Using random token data (smoke / no-data mode)")
+    elif getattr(config, "use_grain", False):
+        from grain_data import make_grain_batches
+        tokenizer = get_tokenizer(config)
+        data_iter = make_grain_batches(config, config.batch_size, config.seq_len,
+                                       tokenizer, sharding=batch_sh)
+        print(f"[train] Streaming {config.dataset} via Grain (device-prefetched)")
     else:
         tokenizer = get_tokenizer(config)
         data_iter = make_batches(config, config.batch_size, config.seq_len, tokenizer)
         print(f"[train] Streaming {config.dataset}")
 
     step_fn = make_train_step(graphdef, config, opt, shardings=(param_sh, opt_sh))
+
+    # In-training sampler: generate a short sample from the live weights every
+    # `gen_every` steps so generation quality can be tracked as training runs.
+    # The forward is jitted once here (params passed as args) and reused.
+    sampler = None
+    if getattr(config, "gen_every", 0) > 0:
+        from generate import build_sampler
+        gen_tok = tokenizer if not use_random_data and config.tokenizer != "byte" \
+            else get_tokenizer(config)
+        sampler = build_sampler(config, graphdef, gen_tok, mesh=mesh)
+        print(f"[train] Sampling every {config.gen_every} steps "
+              f"(prompt {config.gen_prompt!r})")
 
     print(f"[train] Starting training for {config.train_steps} steps...")
     model_fl, hw_fl = step_flops(config)
@@ -493,7 +512,9 @@ def train(config: Config, use_random_data: bool = True, save: bool = True):
     t_win = None       # wall clock at the start of the current logging window
     steps_win = 0      # steps completed inside it
     for step in range(config.train_steps):
-        tokens = jax.device_put(next(data_iter), batch_sh)
+        batch = next(data_iter)
+        # Grain already delivered an on-device sharded array; numpy paths need it.
+        tokens = batch if isinstance(batch, jax.Array) else jax.device_put(batch, batch_sh)
         params, opt_state, loss, metrics = step_fn(params, rest, opt_state, tokens)
         if step == 0:
             # First step pays for compilation; start the throughput clock after it.
@@ -520,6 +541,18 @@ def train(config: Config, use_random_data: bool = True, save: bool = True):
                   f"| lr {float(schedule(step)):.2e} | {sec*1e3:.0f} ms/step "
                   f"| tok/s {tps:,.0f}{mfu}")
             t_win, steps_win = time.time(), 0
+
+        if sampler is not None and (step % config.gen_every == 0
+                                    or step == config.train_steps - 1):
+            jax.block_until_ready(params)      # sample the committed weights
+            t_gen = time.time()
+            text = sampler(params, rest, config.gen_prompt,
+                           max_tokens=config.gen_max_tokens,
+                           temperature=config.gen_temperature,
+                           top_k=config.gen_top_k, seed=step)
+            print(f"  [gen @ step {step}] ({time.time()-t_gen:.1f}s) "
+                  f"{config.gen_prompt!r} -> {text!r}")
+            t_win, steps_win = time.time(), 0   # exclude gen time from throughput
 
     print(f"[train] HBM peak: {hbm_report()}")
     if save:

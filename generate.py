@@ -85,6 +85,69 @@ def sample_next(logits, temperature: float = 1.0, top_k: int = 0, rng=None):
     return idx
 
 
+def build_sampler(config: Config, graphdef, tokenizer, mesh=None, seq_len: int | None = None):
+    """Build a reusable sampler for in-training generation.
+
+    The forward is jitted ONCE over ``(params, rest, tokens)`` -- params and rest
+    carried as arguments (not closed over), so it compiles a single time and is
+    reused at every generation checkpoint instead of recompiling the 7B forward
+    each call. Sampling itself runs on the host.
+
+    No KV cache: each new token reprocesses the fixed ``seq_len`` context (padded
+    right), which keeps the compiled shape constant and the code trivial. That is
+    fine for a short periodic sample of a few dozen tokens; it would be too slow
+    for long-form serving.
+    """
+    from model.sharding import data_sharding
+
+    seq_len = seq_len or config.seq_len
+    pad_id = 0
+    # The model's attention runs under a shard_map that shards the batch axis
+    # over the 'data' mesh axis, so the generation batch must be a multiple of it
+    # (batch-1 fails: "8 does not divide 1"). Replicate the prompt across the data
+    # axis and read row 0 -- each device then processes one row exactly like a
+    # training forward.
+    gdev = mesh.shape["data"] if (mesh is not None and mesh.devices.size > 1) else 1
+    tok_sh = data_sharding(mesh) if gdev > 1 else None
+
+    @jax.jit
+    def forward(params, rest, tokens):
+        model = nnx.merge(graphdef, params, rest)
+        return model.generate(tokens)                      # [gdev, seq_len, V]
+
+    eos = getattr(tokenizer, "eos_id", None)
+    if eos is None:
+        eos = getattr(tokenizer, "eos_token_id", None)
+
+    def encode(prompt: str):
+        if hasattr(tokenizer, "encode"):
+            ids = tokenizer.encode(prompt)
+        else:
+            ids = tokenizer(prompt)["input_ids"]
+        return ids or [0]
+
+    def sample(params, rest, prompt: str, max_tokens: int = 40,
+               temperature: float = 0.8, top_k: int = 40, seed: int = 0) -> str:
+        rng = np.random.default_rng(seed)
+        generated = list(encode(prompt))
+        for _ in range(max_tokens):
+            ctx = generated[-seq_len:]
+            n_real = len(ctx)
+            row = np.full((seq_len,), pad_id, dtype=np.int32)
+            row[:n_real] = ctx
+            x = np.broadcast_to(row, (gdev, seq_len)).copy()   # replicate over data axis
+            xj = jax.device_put(x, tok_sh) if tok_sh is not None else jnp.asarray(x)
+            logits = forward(params, rest, xj)
+            next_id = sample_next(np.asarray(logits[0, n_real - 1]),
+                                  temperature=temperature, top_k=top_k, rng=rng)
+            generated.append(next_id)
+            if eos is not None and next_id == eos:
+                break
+        return tokenizer.decode(generated)
+
+    return sample
+
+
 def generate(config: Config, state, graphdef, prompt: str, max_tokens: int = 100,
              temperature: float = 1.0, top_k: int = 0, seed: int = 0, rest=None):
     """Generate text from a prompt using the model.

@@ -82,6 +82,18 @@ class Config:
     tokenizer: str = "byte"          # 'byte' | 'llama3' | path
     pack_eos_id: Optional[int] = None
 
+    # ---- Grain dataloader (grain_data.py) ----
+    # When True, real-data runs use the Grain pipeline: parquet read + tokenize +
+    # concat-split packing + batch all on a CPU prefetch thread, with batches
+    # double-buffered onto the TPU so the step never waits on the host. False
+    # keeps the hand-rolled thread-prefetch pipeline in data.py.
+    use_grain: bool = False
+    grain_interleave: int = 4        # parquet files read concurrently
+    grain_cpu_buffer: int = 8        # batches buffered on the host prefetch thread
+    grain_device_buffer: int = 2     # batches prefetched per device (in HBM)
+    grain_shuffle_files: bool = True # shuffle shard order before streaming
+    grain_seed: int = 0
+
     # ---- Hardware / sharding ----
     mesh_data_axis: int = 1
     mesh_expert_axis: int = 1
@@ -126,6 +138,15 @@ class Config:
 
     # ---- Inference ----
     infer_seq_len: int = 32768
+
+    # ---- In-training sampling ----
+    # Every `gen_every` steps, generate a short sample from the live weights so
+    # generation quality can be tracked as training proceeds. 0 disables it.
+    gen_every: int = 0
+    gen_prompt: str = "The meaning of life is"
+    gen_max_tokens: int = 40
+    gen_temperature: float = 0.8
+    gen_top_k: int = 40
 
     # ---- Logging ----
     log_every: int = 1
@@ -218,7 +239,12 @@ def full() -> Config:
         # One sequence per v5e chip: the batch axis is sharded over the 8-way
         # 'data' mesh axis, so batch_size must stay a multiple of the device count.
         batch_size=8,
-        seq_len=4096,
+        # 16K context is the biggest MFU lever measured: 21.6% vs 11.5% at 4096
+        # (1.88x), because the fixed ~230ms expert weight-gradient reduce-scatter
+        # amortizes over 4x the tokens. remat_policy MUST be 'full' here -- at
+        # 16384 'dots_no_batch' OOMs (22.1 GB of temporaries); 'full' fits at
+        # batch 8. See BENCHMARKS.md "Sequence length is the biggest MFU lever".
+        seq_len=16384,
         train_steps=100000,
         warmup_steps=2000,
         learning_rate=1e-4,
@@ -227,12 +253,15 @@ def full() -> Config:
         weight_decay=1.0,
         dtype="bf16",
         master_dtype="fp32",
+        remat_policy="full",   # required at seq_len 16384 (dots_no_batch OOMs)
         tokenizer="llama3",
+        use_grain=True,
         mesh_data_axis=8,
         mesh_expert_axis=1,
         checkpoint_every=1000,
         log_every=10,
         infer_seq_len=32768,
+        gen_every=1000,
     )
 
 

@@ -95,6 +95,14 @@ def cmd_train(args):
         config.swa_window = args.swa_window
     if args.swa_period is not None:
         config.swa_period = args.swa_period
+    if args.use_grain is not None:
+        config.use_grain = args.use_grain
+    if args.gen_every is not None:
+        config.gen_every = args.gen_every
+    if args.gen_prompt is not None:
+        config.gen_prompt = args.gen_prompt
+    if args.gen_max_tokens is not None:
+        config.gen_max_tokens = args.gen_max_tokens
     if args.use_kda is not None:
         config.use_kda = args.use_kda
     if args.kda_period is not None:
@@ -179,6 +187,16 @@ def main():
                          help="Tokens each SWA layer attends to (rounded up to 128 on TPU)")
     p_train.add_argument("--swa_period", type=int, default=None,
                          help="Every Nth layer is full attention, the rest are SWA")
+    p_train.add_argument("--gen_every", type=int, default=None,
+                         help="Generate a sample from the live weights every N steps (0=off)")
+    p_train.add_argument("--gen_prompt", type=str, default=None,
+                         help="Prompt for in-training generation")
+    p_train.add_argument("--gen_max_tokens", type=int, default=None,
+                         help="Tokens to generate per in-training sample")
+    p_train.add_argument("--use_grain", dest="use_grain", action="store_true", default=None,
+                         help="Stream real data through the Grain dataloader (grain_data.py)")
+    p_train.add_argument("--no_grain", dest="use_grain", action="store_false",
+                         help="Use the data.py thread-prefetch pipeline instead of Grain")
     p_train.add_argument("--use_kda", dest="use_kda", action="store_true", default=None,
                          help="KDA linear-attention hybrid (SLOW: see model/kda.py)")
     p_train.add_argument("--no_kda", dest="use_kda", action="store_false",

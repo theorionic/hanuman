@@ -104,7 +104,7 @@ Two configurations, because the answer is completely different in each:
 |---|---|---|---|
 | Attention | 72.8 ms (6.5%) | 876.6 ms (25.1%) | 12.0x |
 | MoE expert matmul | 191.1 (17.1%) | 808.2 (23.1%) | 4.2x |
-| MoE dispatch (sort/gather/combine) | 120.4 (10.8%) | 802.6 (23.0%) | 6.7x |
+| MoE dispatch (permute/gather/combine) | 120.4 (10.8%) | 802.6 (23.0%) | 6.7x |
 | **MoE expert-weight comm** | **374.6 (33.5%)** | 476.5 (13.6%) | 1.3x |
 | Other weight comm (FSDP) | 215.1 (19.2%) | 158.9 (4.5%) | 0.7x |
 | scan plumbing / router / norms / loss | 144.4 (12.9%) | 370.8 (10.6%) | -- |
@@ -123,19 +123,49 @@ length at all:
 |---|---|---|---|
 | expert-weight **reduce-scatter** (weight grad) | 230.2 ms | 230.7 ms | **1.00x** |
 | splash attention core | 61.2 | 812.1 | 13.3x (O(S^2)) |
-| routing `argsort`/`bincount` | 36.7 | 449.3 | **12.2x** |
+| **dispatch row gather + bwd scatter** (`moe.py:55`) | 23.6 | **395.3** | **16.7x** |
 | expert weight-gradient (dW) | 103.0 | 410.0 | 4.0x |
 | `ragged_dot` (fwd + dgrad) | 73.8 | 302.3 | 4.1x |
+| un-permute gather + combine + bwd (`moe.py:80`) | 70.0 | 283.7 | 4.1x |
 | expert-weight all-gather | 75.5 | 187.9 | 2.5x |
-| un-permute gather | 37.9 | 151.5 | 4.0x |
-| scatter-add (bwd of un-permute) | 28.0 | 115.8 | 4.1x |
+| `bincount` (`moe.py:56`) | 12.1 | 48.5 | 4.0x |
+| **the actual `argsort`** (`moe.py:54`) | **0.9** | **5.4** | 5.9x |
 
 The reduce-scatter is **exactly constant** at 230 ms: it depends on parameter
 count, not on tokens. That is the cleanest statement of why long context pays.
 
-The routing sort is genuinely superlinear -- 12.2x for 4x the rows, measured at
-identical `remat_policy=full` on both sides so it is not a remat artifact. At
-16384 it is the second-largest op in the whole step.
+### The dispatch permutation, not the sort, is the MoE overhead
+
+The routing *sort* is negligible -- 5.4 ms/step at 16384. Isolated, an
+`argsort` of 131072 int32 keys takes 0.12 ms, and neither `stable=False` nor an
+O(n) counting sort beats it (0.099 ms and 2.06 ms respectively). There is
+nothing to win there.
+
+What costs is moving the **tokens**. Top-8 routing replicates every token 8x
+into a `[T*K, D]` buffer -- 131072 x 1536 bf16 = 402 MB per layer per call at
+seq 16384 -- and that buffer is gathered on the way in, scatter-added on the way
+back, and gathered again for the un-permute:
+
+| moe.py | stage | 4096 | 16384 | ratio |
+|---|---|---|---|---|
+| :54 | `argsort` | 0.9 | 5.4 | 5.9x |
+| :55 | row gather `x[order//K]` + bwd scatter | 23.6 | **395.3** | **16.7x** |
+| :56 | `bincount` | 12.1 | 48.5 | 4.0x |
+| :79 | inverse permutation | 0.9 | 5.4 | 5.8x |
+| :80 | un-permute gather + combine + bwd | 70.0 | 283.7 | 4.1x |
+| | **total dispatch data movement** | **107.7** | **738.4** | **6.9x** |
+
+738 ms is 21% of the step at 16384, all of it pure HBM traffic with the MXU
+idle, and the `:55` gather is badly superlinear: 4x the bytes for 16.7x the
+time, so it is not bandwidth-bound but access-pattern-bound (a random row
+gather at 402 MB defeats whatever locality it had at 100 MB). The same
+`[T*K, D]` buffer is also the memory wall -- it is why batch 16 OOMs at seq
+16384 (18.86 GB of temporaries) and why 32768 does not fit at all.
+
+This is the case for a fused Pallas dispatch kernel: one that gathers rows
+directly into the MXU tile inside the grouped matmul and never materializes
+`[T*K, D]` at all. It would attack the largest remaining time cost, the memory
+wall, and the context ceiling with one change.
 
 ### The expert weight-gradient is the fragile op
 
@@ -327,10 +357,13 @@ size. The first two are the whole game.
    parameter-proportional communication are fixed per step.
 2. **The expert weight-gradient's masked-dense lowering** (82x declared FLOP
    inflation; 24% of peak at best, 1.6% in the worst measured config). A Pallas
-   grouped-dW kernel is the fix. At 16384 this is 410 ms/step, 12%.
-3. **The routing `argsort`** -- 449 ms/step (12.9%) at 16384 and superlinear.
-   The dispatch only needs rows grouped by expert, not a full sort; a counting
-   sort over 80 buckets is O(n).
+   grouped-dW kernel is the fix. At 16384 this is 410 ms/step, 12%. Check first
+   whether a different `ragged_dot_general` dimension-numbers spelling gets XLA
+   to emit a real grouped dW -- that would be a far smaller change.
+3. **The dispatch permutation** -- 738 ms/step (21%) at 16384 of pure HBM
+   traffic, and the `[T*K, D]` buffer behind it is also what caps batch at 8 and
+   context at 16K. A fused Pallas dispatch kernel is the fix. (Not the sort:
+   that is 5.4 ms and nothing beats it.)
 4. **Expert parallelism**, to remove the 230 ms reduce-scatter. Details below.
 5. Merging the `gate`/`up` ragged_dots: +7.8% of that stage, ~1.8% of the step.
 

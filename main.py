@@ -89,7 +89,17 @@ def cmd_train(args):
         config.mesh_data_axis = args.data_axis
     if args.expert_axis is not None:
         config.mesh_expert_axis = args.expert_axis
-    use_random = args.config == "smoke" or args.random_data
+    if args.use_swa is not None:
+        config.use_swa = args.use_swa
+    if args.swa_window is not None:
+        config.swa_window = args.swa_window
+    if args.swa_period is not None:
+        config.swa_period = args.swa_period
+    if args.use_kda is not None:
+        config.use_kda = args.use_kda
+    if args.kda_period is not None:
+        config.kda_period = args.kda_period
+    use_random = args.config.startswith("smoke") or args.random_data
     train(config, use_random_data=use_random, save=not args.no_save)
 
 
@@ -132,7 +142,7 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_train = sub.add_parser("train", help="Run training")
-    p_train.add_argument("--config", default="smoke", choices=["smoke", "full"])
+    p_train.add_argument("--config", default="smoke", choices=list(__import__("config").PRESETS))
     p_train.add_argument("--steps", type=int, default=None)
     p_train.add_argument("--batch", type=int, default=None)
     p_train.add_argument("--seq_len", type=int, default=None)
@@ -161,10 +171,24 @@ def main():
                          help="Force block rematerialization on")
     p_train.add_argument("--no_remat", dest="remat", action="store_false",
                          help="Disable block rematerialization")
+    p_train.add_argument("--use_swa", dest="use_swa", action="store_true", default=None,
+                         help="Sliding-window attention hybrid")
+    p_train.add_argument("--no_swa", dest="use_swa", action="store_false",
+                         help="Disable the SWA hybrid")
+    p_train.add_argument("--swa_window", type=int, default=None,
+                         help="Tokens each SWA layer attends to (rounded up to 128 on TPU)")
+    p_train.add_argument("--swa_period", type=int, default=None,
+                         help="Every Nth layer is full attention, the rest are SWA")
+    p_train.add_argument("--use_kda", dest="use_kda", action="store_true", default=None,
+                         help="KDA linear-attention hybrid (SLOW: see model/kda.py)")
+    p_train.add_argument("--no_kda", dest="use_kda", action="store_false",
+                         help="Disable the KDA hybrid")
+    p_train.add_argument("--kda_period", type=int, default=None,
+                         help="Every Nth layer is full attention, the rest are KDA")
     p_train.set_defaults(func=cmd_train)
 
     p_gen = sub.add_parser("generate", help="Generate text")
-    p_gen.add_argument("--config", default="smoke", choices=["smoke", "full"])
+    p_gen.add_argument("--config", default="smoke", choices=list(__import__("config").PRESETS))
     p_gen.add_argument("--prompt", default="Once upon a time")
     p_gen.add_argument("--max_tokens", type=int, default=100)
     p_gen.add_argument("--temperature", type=float, default=1.0)
@@ -174,10 +198,10 @@ def main():
     p_gen.set_defaults(func=cmd_generate)
 
     p_count = sub.add_parser("count", help="Print param counts")
-    p_count.add_argument("--config", default="full", choices=["smoke", "full"])
+    p_count.add_argument("--config", default="full", choices=list(__import__("config").PRESETS))
 
     p_report = sub.add_parser("report", help="Per-tensor sharding and HBM table")
-    p_report.add_argument("--config", default="full", choices=["smoke", "full"])
+    p_report.add_argument("--config", default="full", choices=list(__import__("config").PRESETS))
     p_report.set_defaults(func=cmd_report)
     p_count.set_defaults(func=cmd_count)
 

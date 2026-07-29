@@ -30,24 +30,29 @@ def _is_traced(x) -> bool:
 
 
 def _normalize_window(window):
-    """Normalize a window value to `None` (full causal) or an int/traced int.
+    """Normalize a window value to `None` (full causal) or a positive int.
 
-    0 and None both mean "full causal attention". A concrete 0 -> None so the
-    downstream `local_window_size=None` path is taken. A *traced* 0 (from a
-    lax.scan per-layer array) cannot be tested with a Python `if`, so it is
-    passed through as-is and `causal_attention` handles it with lax.cond /
-    dynamic masking. Positive ints are returned unchanged.
+    0 and None both mean "full causal attention", so a 0 becomes None and the
+    downstream `local_window_size=None` path is taken.
+
+    The window must be *static*. It shapes the attention mask, and Splash
+    materializes that mask's block-sparse metadata at trace time, so a traced
+    window silently disables Splash and falls back to `dot_product_attention`
+    -- which is 5.5x slower on TPU (measured: 75.2 ms vs 13.6 ms for 8 layers
+    fwd+bwd at S=4096). That is a big enough cliff to be worth an exception
+    rather than a silent deoptimization: per-layer windows are selected with
+    `lax.switch` over a static tuple of choices (see `causal_attention`), never
+    by threading a traced window through.
     """
     if window is None:
         return None
-    try:
-        # Concrete int / numpy scalar.
-        if int(window) == 0:
-            return None
-        return int(window)
-    except (TypeError, ValueError):
-        # Traced scalar from scan: leave as-is.
-        return window
+    if _is_traced(window):
+        raise TypeError(
+            "causal_attention got a traced sliding-window size. The window must "
+            "be static (it shapes the Splash block-sparse mask at trace time). "
+            "Use window_sel + window_choices to pick a per-layer window inside a "
+            "scan.")
+    return int(window) or None
 
 
 @functools.lru_cache(maxsize=16)
@@ -116,10 +121,42 @@ def _splash_window(window: int | None) -> int | None:
     return ((window + _MIN_BLOCK - 1) // _MIN_BLOCK) * _MIN_BLOCK
 
 
-def causal_attention(q, k, v, head_dim: int, mesh=None, window: int | None = None):
-    """Causal GQA. Splash on TPU, XLA elsewhere.
+def causal_attention(q, k, v, head_dim: int, mesh=None, window: int | None = None,
+                     window_sel=None, window_choices=None):
+    """Causal GQA with an optional sliding window. Splash on TPU, XLA elsewhere.
 
     q: [B, S, Nq, H], k/v: [B, S, Nkv, H] -> [B, S, Nq, H]
+
+    Two ways to specify the window, both of which keep it *static* so the Splash
+    mask can be built at trace time:
+
+      - `window`: a plain int (or None for full causal). Used when the caller
+        knows the window at trace time, i.e. outside a scan.
+      - `window_sel` + `window_choices`: `window_choices` is a static tuple of
+        the distinct windows this layer might use, and `window_sel` is a traced
+        index into it. This is what the scanned BlockStack uses for the SWA
+        hybrid: the scan compiles one body, but the body dispatches through
+        `lax.switch` to a branch per window, each with its own statically-masked
+        Splash kernel. XLA's Conditional executes only the selected branch, so
+        the cost is one attention call, not len(window_choices) of them.
+
+    Threading a *traced* window straight into the mask instead is what the
+    naive version did, and it silently drops every layer onto the XLA fallback
+    (see `_normalize_window`).
+    """
+    if window_sel is not None and window_choices and len(window_choices) > 1:
+        branches = [functools.partial(_attend, head_dim=head_dim, mesh=mesh,
+                                      window=_normalize_window(w))
+                    for w in window_choices]
+        return jax.lax.switch(window_sel, branches, q, k, v)
+    if window_sel is not None and window_choices:
+        window = window_choices[0]
+    return _attend(q, k, v, head_dim=head_dim, mesh=mesh,
+                   window=_normalize_window(window))
+
+
+def _attend(q, k, v, *, head_dim: int, mesh=None, window: int | None = None):
+    """One causal (optionally sliding-window) attention with a static window.
 
     `jax.nn.dot_product_attention` has no TPU flash path: it materializes the
     full [Nq, S, S] score matrix and applies the causal mask afterwards, so it
@@ -144,35 +181,12 @@ def causal_attention(q, k, v, head_dim: int, mesh=None, window: int | None = Non
     multiple of 128 (see `_splash_window`) because Splash tiles at 128.
     """
     S = q.shape[1]
-    # Normalize: 0 / None -> full causal. A traced 0 (from a per-layer scan
-    # array) can't be tested with a Python `if`, so we keep it as a traced int
-    # and let the XLA path substitute the full seq_len for 0 below.
-    if window is not None:
-        try:
-            if int(window) == 0:
-                window = None
-        except (TypeError, ValueError):
-            pass  # traced scalar, handle in the XLA branch
-
-    # Splash needs a *static* window to build the block-sparse mask at trace
-    # time, so a traced window (per-layer scan array) cannot use Splash. In that
-    # case fall through to the XLA path, which accepts a dynamic window.
-    splash_window = _splash_window(window) if isinstance(window, int) else None
-    use_splash = (_can_splash(S, head_dim, splash_window)
-                  and not _is_traced(window))
-    if not use_splash:
-        # XLA fallback. local_window_size=(left, right): left=window tokens in
-        # the past, right=0 (no future). is_causal=True still applies. When
-        # window is None -> full causal (local_window_size=None). When window is
-        # a traced scalar, 0 means full causal -- substitute the full seq_len so
-        # the local window is a no-op (is_causal already bounds it).
-        if window is None:
-            lws = None
-        elif _is_traced(window):
-            eff = jnp.where(window == 0, S, window)
-            lws = (eff, 0)
-        else:
-            lws = (int(window), 0)
+    splash_window = _splash_window(window)
+    if not _can_splash(S, head_dim, splash_window):
+        # XLA fallback (CPU/GPU, or a shape Splash cannot tile).
+        # local_window_size=(left, right): `window` tokens in the past, 0 in the
+        # future. is_causal=True still applies. window=None -> full causal.
+        lws = None if window is None else (int(window), 0)
         return jax.nn.dot_product_attention(q, k, v, is_causal=True,
                                             local_window_size=lws)
 
@@ -206,7 +220,8 @@ class Attention(nnx.Module):
     """
 
     def __init__(self, d_model: int, n_q_heads: int, n_kv_heads: int, head_dim: int,
-                 dtype, rngs: nnx.Rngs, mesh=None, window: int | None = None):
+                 dtype, rngs: nnx.Rngs, mesh=None, window: int | None = None,
+                 window_choices=None):
         self.n_q_heads = n_q_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
@@ -219,6 +234,11 @@ class Attention(nnx.Module):
         # -- the window shapes the attention mask, which must be known when the
         # kernel is compiled, so it cannot be a traced array.
         self.window = window
+        # When this layer lives in a scanned BlockStack whose layers do NOT all
+        # share a window, one compiled body has to serve several windows. The
+        # distinct windows are enumerated here (static) and the scan supplies a
+        # traced index into them at call time; see `causal_attention`.
+        self.window_choices = tuple(window_choices) if window_choices else None
 
         qkv_dim = n_q_heads * head_dim
         kv_dim = n_kv_heads * head_dim
@@ -228,16 +248,12 @@ class Attention(nnx.Module):
         self.wv = nnx.Param(jax.random.normal(rngs.params(), (d_model, kv_dim)) * std)
         self.wo = nnx.Param(jax.random.normal(rngs.params(), (qkv_dim, d_model)) * std)
 
-    def __call__(self, x, cos, sin, positions=None, window: int | None = None):
-        # `window` can be overridden at call time. This is how the BlockStack
-        # scan applies a per-layer window from a `windows` array: the scan body
-        # passes the per-step value (0 = full causal, >0 = SWA window). If
-        # neither the call-time nor the init-time window is set, the layer is
-        # full causal attention. 0 is treated as "no window" everywhere.
+    def __call__(self, x, cos, sin, positions=None, window: int | None = None,
+                 window_sel=None):
+        # `window` (static int) can be overridden at call time; `window_sel` is
+        # the scanned per-layer index into self.window_choices used by the SWA
+        # hybrid. Neither set -> full causal attention.
         w = window if window is not None else self.window
-        # A traced 0 from lax.scan can't be compared to 0 with a Python `if`,
-        # so normalize via a helper that handles both concrete and traced ints.
-        w = _normalize_window(w)
         B, S, D = x.shape
         x = x.astype(self.dtype)
         q = x @ self.wq.astype(self.dtype)  # [B, S, Nq*H]
@@ -249,7 +265,9 @@ class Attention(nnx.Module):
 
         q, k = apply_rope(q, k, cos.astype(self.dtype), sin.astype(self.dtype), positions)
 
-        out = causal_attention(q, k, v, self.head_dim, self.mesh, window=w)
+        out = causal_attention(q, k, v, self.head_dim, self.mesh, window=w,
+                               window_sel=window_sel,
+                               window_choices=self.window_choices)
         out = out.reshape(B, S, self.n_q_heads * self.head_dim).astype(self.dtype)
         out = out @ self.wo.astype(self.dtype)
         return out.astype(jnp.float32)

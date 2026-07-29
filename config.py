@@ -166,23 +166,39 @@ def smoke() -> Config:
         log_every=1,
         mesh_data_axis=1,
         mesh_expert_axis=1,
-        # Exercise the SWA code path on CPU. smoke seq_len=128, so a window of
-        # 64 means each SWA layer attends to 64 tokens (half the sequence) --
+        # Exercise the SWA code path. smoke seq_len=128, so a window of 64
+        # means each SWA layer attends to 64 tokens (half the sequence) --
         # small enough to actually constrain the window, large enough to train.
+        #
+        # KDA is deliberately NOT enabled here as well. `use_kda` outranks
+        # `use_swa` in Transformer.layer_attention_type, so a preset that sets
+        # both silently tests only KDA and leaves SWA -- the path that is
+        # actually on by default in long-context runs -- completely uncovered.
+        # See smoke_kda() for the KDA hybrid.
         use_swa=True,
         swa_window=64,
         swa_period=2,
-        # Exercise the KDA code path on CPU. With 2 layers and kda_period=2:
-        # layer 0 = KDA, layer 1 = full attention. KDA heads/dim are tiny so
-        # the smoke test stays fast on CPU.
-        use_kda=True,
-        kda_period=2,
-        kda_heads=2,
-        kda_head_dim=32,
-        # KDA and full-attention layers have different module structures, so a
-        # mixed stack cannot be lax.scan'd. Disable scan for the KDA hybrid.
-        use_scan=False,
     )
+
+
+def smoke_kda() -> Config:
+    """Smoke preset for the KDA hybrid (see smoke() for why it is separate).
+
+    With 2 layers and kda_period=2: layer 0 = KDA, layer 1 = full attention.
+    KDA heads/dim are tiny so this stays fast on CPU. `use_scan` is off because
+    KDA and full-attention layers have different module structures and a mixed
+    stack cannot be lax.scan'd.
+    """
+    c = smoke()
+    c.name = "smoke_kda"
+    c.use_swa = False
+    c.use_kda = True
+    c.kda_period = 2
+    c.kda_heads = 2
+    c.kda_head_dim = 32
+    c.kda_chunk_size = 16
+    c.use_scan = False
+    return c
 
 
 def full() -> Config:
@@ -220,7 +236,7 @@ def full() -> Config:
     )
 
 
-PRESETS = {"smoke": smoke, "full": full}
+PRESETS = {"smoke": smoke, "smoke_kda": smoke_kda, "full": full}
 
 
 def get_config(name: str) -> Config:

@@ -1,11 +1,40 @@
 """Kimi Delta Attention (KDA) -- linear attention with the delta update rule.
 
 Implements the recurrent form of KDA (Kimi-Linear, arXiv:2507.05927) using a
-`jax.lax.scan` over the sequence, vectorized over batch and heads. This is the
-O(N) memory / O(N) time form. The chunked parallel form (WY representation +
-associative_scan across chunks) is a documented future optimization -- the
-recurrent scan form is correct and trainable, and for the smoke config
-(seq_len=128) it is fast enough on CPU.
+`jax.lax.scan` over the sequence, vectorized over batch and heads.
+
+STATUS: correct and trainable, but NOT usable at real scale yet. The recurrence
+is S sequential steps per layer, and each step is a handful of einsums on a
+[B, H, K, V] state that is entirely memory-bound -- the MXU is idle throughout,
+so the cost is set by HBM traffic times the step count, not by the (genuinely
+much lower) FLOP count.
+
+Measured on TPU v5e-8, 7B config cut to 4 layers, seq_len=4096, kda_period=4:
+
+    all full attention   187 ms/step   (~47 ms per layer)
+    3 KDA + 1 full      1421 ms/step   (~460 ms per KDA layer)
+
+so a KDA layer costs ~10x the *entire* transformer layer it replaces, against a
+softmax attention whose Splash kernel is ~1.4 ms of that layer. Extrapolated to
+the full 24-layer model this is a ~10x slowdown, which is why use_kda stays off
+by default and the CLI flag is labelled SLOW.
+
+Closing that gap needs the chunked *parallel* form: within a chunk the delta
+rule becomes a unit-lower-triangular solve (the WY / UT transform) that turns
+the sequential recurrence into two matmuls, leaving only the chunk-to-chunk
+state transition sequential. That form has a real numerical-stability design
+problem -- it factors exp(c_t - c_j) into exp(c_t)/exp(c_j), and with a
+non-positive cumulative decay the denominator underflows -- which is why it is
+not attempted here rather than shipped subtly wrong. This recurrent form is the
+reference such an implementation should be validated against.
+
+Making KDA competitive needs the chunked *parallel* form: within a chunk the
+delta rule becomes a unit-lower-triangular solve (the WY / UT transform) that
+turns the sequential recurrence into two matmuls, and only the chunk-to-chunk
+state transition stays sequential. That form has a real numerical-stability
+design problem -- it factors exp(c_t - c_j) into exp(c_t)/exp(c_j), and with a
+non-positive cumulative decay the denominator underflows -- which is why it is
+not attempted here rather than shipped subtly wrong.
 
 Why the delta rule (not plain linear attention):
   Plain linear attention updates the state as  S += outer(k, v)  and reads
@@ -62,10 +91,17 @@ class ShortConv1D(nnx.Module):
     matters because linear-attention states otherwise see tokens one at a time
     with no local window.
 
-    For training (full sequence) we use `jax.lax.conv_general_dilated` with
-    'CAUSAL' padding so the convolution is causal (token t only sees t-3..t).
-    The kernel layout is [in_channels, 1, kernel_size] (depthwise = one
-    filter per channel, spatial dim 1, 4 taps).
+    For training (full sequence) this is evaluated as `kernel_size` shifted
+    multiply-adds rather than `jax.lax.conv_general_dilated`. A depthwise conv
+    is `feature_group_count=dim` groups, and dim here is n_heads*head_dim =
+    8192 for the 7B config -- XLA:TPU miscompiles that many feature groups
+    outright (HLO verifier RET_CHECK on a malformed broadcast, `f32[8192,1,1]
+    broadcast(bf16[1,8192])`). The shifted-sum form is also strictly cheaper:
+    4 fused multiply-adds over [B, S, D] with no im2col and no group handling.
+
+    Causality comes from shifting only toward the future: tap i is multiplied
+    by the input shifted right by (kernel_size-1-i), so output[t] reads
+    input[t-kernel_size+1 .. t] and never input[>t].
 
     A `step(x_t, state)` method is provided for recurrent inference: `state`
     is the sliding window of the last (kernel_size-1) inputs for this channel,
@@ -85,27 +121,19 @@ class ShortConv1D(nnx.Module):
 
     def __call__(self, x_seq):
         """x_seq: [B, S, D] -> [B, S, D] (causal depthwise conv)."""
-        B, S, D = x_seq.shape
-        # 1D depthwise conv via conv_general_dilated. dimension_numbers use
-        # "NHC" (batch, spatial, channel) for lhs/out and "HIO" for the kernel
-        # (spatial, in, out). Depthwise = feature_group_count=D, so the kernel
-        # has in=1, out=D per group: shape [K, 1, D].
-        x = x_seq.astype(jnp.float32)  # [B, S, D]
-        w = self.weight.value  # [D, 1, K]
-        # Build HIO: [K, 1, D].
-        w_hio = jnp.transpose(w, (2, 1, 0))  # [K, 1, D]
-        # Causal padding: pad (K-1) on the left of the sequence axis, 0 on the
-        # right, so output[t] depends on input[t-K+1..t]. One spatial dim ->
-        # a single (K-1, 0) entry.
-        pad = [(self.kernel_size - 1, 0)]
-        y = jax.lax.conv_general_dilated(
-            x, w_hio,
-            window_strides=(1,),
-            padding=pad,
-            dimension_numbers=("NHC", "HIO", "NHC"),
-            feature_group_count=D,
-        )
-        return y.astype(x_seq.dtype)  # [B, S, D]
+        K = self.kernel_size
+        x = x_seq.astype(jnp.float32)          # [B, S, D]
+        w = self.weight.value[:, 0, :]         # [D, K]
+        y = 0.0
+        for i in range(K):
+            shift = K - 1 - i                  # tap i reads input[t - shift]
+            if shift == 0:
+                xs = x
+            else:
+                # Shift right along the sequence axis, zero-filling the front.
+                xs = jnp.pad(x[:, :-shift], ((0, 0), (shift, 0), (0, 0)))
+            y = y + xs * w[:, i]               # w[:, i] is [D], broadcasts over B,S
+        return y.astype(x_seq.dtype)           # [B, S, D]
 
     def step(self, x_t, state):
         """Recurrent step. x_t: [B, D], state: [B, D, K-1] (last K-1 inputs).
@@ -160,7 +188,11 @@ class KDA(nnx.Module):
         self.head_dim = head_dim          # K
         self.head_v_dim = head_dim        # V = K (KDA uses V=K)
         self.dtype = dtype
-        self.chunk_size = chunk_size      # reserved for a future chunked form
+        # Tokens per rematerialized chunk of the sequence recurrence. Trades
+        # recompute against the residual memory of the backward pass; see
+        # __call__. Not the chunk of the (still unimplemented) chunked
+        # *parallel* form.
+        self.chunk_size = chunk_size
 
         H, K, V = n_heads, head_dim, self.head_v_dim
         D = d_model
@@ -270,7 +302,7 @@ class KDA(nnx.Module):
 
         S0 = jnp.zeros((B, H, K, V), dtype=jnp.float32)
 
-        def step_fn(carry, inputs):
+        def step_fn(carry, inputs):  # noqa: D401 -- one token of the recurrence
             S = carry  # [B, H, K, V]
             q_i, k_i, v_i, g_i, b_i = inputs
             # q_i, k_i, g_i: [B, H, K]; v_i: [B, H, V]; b_i: [B, H]
@@ -290,8 +322,40 @@ class KDA(nnx.Module):
             o_i = jnp.einsum("bhkv,bhk->bhv", S, q_i) * scale  # [B, H, V]
             return S, o_i
 
-        S_final, o_t = jax.lax.scan(step_fn, S0, (q_t, k_t, v_t, g_t, beta_t))
-        # o_t: [S, B, H, V] -> [B, S, H, V]
+        # Two-level scan: an outer scan over chunks whose body is rematerialized,
+        # and an inner scan over the tokens of one chunk.
+        #
+        # A single flat scan over all S tokens is what makes the recurrent form
+        # unusable at real sequence lengths. Reverse-mode AD through lax.scan
+        # stacks one residual per iteration, and the carry alone is
+        # [B, H, K, V] float32 -- 4.19 MB per device for the 7B config
+        # (H=64, K=V=128). Over S=4096 tokens that is 17.2 GB per KDA layer,
+        # which no 16 GB chip can hold no matter what the block-level remat
+        # policy says.
+        #
+        # Checkpointing the chunk body caps the live residuals at
+        # (S/chunk) outer carries + (chunk) inner residuals instead of S of
+        # them: at chunk=64 that is 64*4.19 + 64*4.19 MB ~= 0.54 GB per layer.
+        # The backward re-runs each chunk's inner scan, so this costs one extra
+        # forward over the recurrence.
+        chunk = max(1, int(self.chunk_size))
+        if S % chunk != 0:
+            # Fall back to one chunk rather than silently truncating; callers
+            # use power-of-two sequence lengths, so this is the odd case only.
+            chunk = S
+        n_chunks = S // chunk
+
+        def to_chunks(a):
+            return a.reshape(n_chunks, chunk, *a.shape[1:])
+
+        def chunk_fn(S_state, chunk_inputs):
+            return jax.lax.scan(step_fn, S_state, chunk_inputs)
+
+        S_final, o_c = jax.lax.scan(
+            jax.checkpoint(chunk_fn), S0,
+            tuple(to_chunks(a) for a in (q_t, k_t, v_t, g_t, beta_t)))
+        # o_c: [n_chunks, chunk, B, H, V] -> [S, B, H, V] -> [B, S, H, V]
+        o_t = o_c.reshape(S, *o_c.shape[2:])
         o = jnp.transpose(o_t, (1, 0, 2, 3))   # [B, S, H, V]
 
         # ---- Output gating: RMSNorm(o) * sigmoid(gate), then W_o ----

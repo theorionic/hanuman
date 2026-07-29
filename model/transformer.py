@@ -52,7 +52,8 @@ class Block(nnx.Module):
                  window: int | None = None,
                  attention_type: str = "full",
                  kda_heads: int = 64, kda_head_dim: int = 128,
-                 kda_chunk_size: int = 64):
+                 kda_chunk_size: int = 64,
+                 window_choices=None):
         self.attention_type = attention_type
         self.norm1 = RMSNorm(d_model, norm_eps, dtype)
         if attention_type == "kda":
@@ -63,7 +64,8 @@ class Block(nnx.Module):
                             chunk_size=kda_chunk_size)
         else:
             self.attn = Attention(d_model, n_q_heads, n_kv_heads, head_dim, dtype,
-                                  rngs, mesh=mesh, window=window)
+                                  rngs, mesh=mesh, window=window,
+                                  window_choices=window_choices)
         self.norm2 = RMSNorm(d_model, norm_eps, dtype)
         if use_moe:
             self.ffn = MoE(d_model, d_ff, n_experts, n_active, n_shared_experts,
@@ -75,14 +77,15 @@ class Block(nnx.Module):
         # residual scale (DeepSeek-style learnable scalar, init 1.0)
         self.residual_scale = nnx.Param(jnp.array(residual_scale_init, dtype=jnp.float32))
 
-    def __call__(self, x, cos, sin, positions=None, window=None):
+    def __call__(self, x, cos, sin, positions=None, window=None, window_sel=None):
         # pre-norm attention
         h = self.norm1(x)
         if self.attention_type == "kda":
             # KDA ignores cos/sin/positions/window (no RoPE, no sliding window).
             a = self.attn(h)
         else:
-            a = self.attn(h, cos, sin, positions=positions, window=window)
+            a = self.attn(h, cos, sin, positions=positions, window=window,
+                          window_sel=window_sel)
         x = x + self.residual_scale.astype(jnp.float32) * a
         # pre-norm FFN
         h = self.norm2(x)
@@ -126,19 +129,23 @@ class BlockStack(nnx.Module):
     remat region) produced an HLO graph that took minutes and hundreds of GB of
     host RAM to optimize.
 
-    SWA hybrid: `windows` is a per-layer array of sliding-window sizes (0 means
-    full causal attention, >0 means attend to that many tokens to the left). It
-    is scanned alongside the layer state so each layer gets its own window from
-    a single compiled body. The XLA attention path accepts a dynamic
-    `local_window_size`, so this works directly on CPU/GPU. On TPU the Splash
-    mask is built at trace time and needs a static window; there the block's
-    init-time `window` (static) is used as the mask shape and the call-time
-    window is ignored -- so for TPU, all layers in one stack must share the
-    same window (set via the block's `window` arg). Splitting mixed-window
-    layers into separate stacks is the TPU-safe way to vary windows.
+    SWA hybrid: when the layers in this stack do not all share one window,
+    `window_sel` is a static per-layer tuple of indices into the block's
+    `window_choices`. The index is scanned alongside the layer state, and the
+    body dispatches on it with `lax.switch` -- one branch per distinct window,
+    each carrying its own statically-masked Splash kernel.
+
+    The window must never be threaded through the scan as a *value*. Splash
+    builds its block-sparse mask at trace time, so a traced window silently
+    drops every layer onto `jax.nn.dot_product_attention`, which materializes
+    the full [Nq, S, S] scores: 75.2 ms vs 13.6 ms for 8 layers fwd+bwd at
+    S=4096. When every layer shares a window (the common case, including the
+    default all-full-causal model) `window_sel` is None and the scan carries no
+    window input at all.
     """
 
-    def __init__(self, n: int, make_block, remat: bool, policy: str = "full"):
+    def __init__(self, n: int, make_block, remat: bool, policy: str = "full",
+                 window_sel=None):
         blocks = [make_block() for _ in range(n)]
         graphdefs, states = zip(*[nnx.split(b) for b in blocks])
         # Same structure for every block, so stacking leaf-by-leaf gives one
@@ -148,37 +155,29 @@ class BlockStack(nnx.Module):
         self.n = n
         self.remat = remat
         self.policy = policy
+        # Plain tuple of ints (or None) -- static, so it is not a state leaf.
+        self.window_sel = tuple(window_sel) if window_sel is not None else None
 
-    def __call__(self, x, cos, sin, positions=None, windows=None):
+    def __call__(self, x, cos, sin, positions=None):
         graphdef, state = nnx.split(self.blocks)
 
-        # `windows` is [n] int (0 = full causal, >0 = SWA window). When None,
-        # every layer is full causal attention (the default, pre-SWA behavior).
-        # We scan it as a second input alongside the per-layer state so the
-        # body sees one window per step.
-        if windows is not None:
-            # Normalize: 0 -> None (full causal) for the attention call. We keep
-            # the raw int here and convert inside the body so the scan input is
-            # a plain int array.
-            scan_windows = jnp.asarray(windows, dtype=jnp.int32)
-        else:
-            scan_windows = jnp.zeros((self.n,), dtype=jnp.int32)
-
-        def body(carry, packed):
-            layer_state, layer_window = packed
+        def run(carry, layer_state, layer_sel):
             block = nnx.merge(graphdef, layer_state)
-            # layer_window is a traced scalar from the scan: 0 = full causal,
-            # >0 = sliding window of that size. We pass it straight through; the
-            # attention code treats 0 as "no window" (full causal). The XLA
-            # path takes it directly as local_window_size. For the Splash path
-            # (TPU only) a traced window cannot shape the mask; the Attention
-            # module falls back to its static init `window` in that case, so the
-            # call-time value is only honored on the XLA path.
-            return block(carry, cos, sin, positions=positions, window=layer_window)
+            return block(carry, cos, sin, positions=positions,
+                         window_sel=layer_sel)
+
+        if self.window_sel is None:
+            # Homogeneous stack: no extra scan input, the block's static
+            # init-time window is authoritative.
+            body = lambda carry, layer_state: run(carry, layer_state, None)
+            xs = state
+        else:
+            body = lambda carry, packed: run(carry, packed[0], packed[1])
+            xs = (state, jnp.asarray(self.window_sel, dtype=jnp.int32))
 
         pol = remat_policy(self.policy) if self.remat else None
         f = body if (not self.remat or self.policy == "none") else jax.checkpoint(body, policy=pol)
-        x, aux = jax.lax.scan(f, x, (state, scan_windows))
+        x, aux = jax.lax.scan(f, x, xs)
         return x, aux
 
 
@@ -254,7 +253,7 @@ class Transformer(nnx.Module):
         self._layer_types = nnx.data([layer_attention_type(i) for i in range(config.layers)])
 
         # ---- Block factory ----
-        def make_block(use_moe, attention_type, window=None):
+        def make_block(use_moe, attention_type, window=None, window_choices=None):
             return lambda: Block(
                 d_model=config.d_model,
                 n_q_heads=config.n_q_heads,
@@ -275,6 +274,7 @@ class Transformer(nnx.Module):
                 rngs=rngs,
                 mesh=mesh,
                 window=window,
+                window_choices=window_choices,
                 attention_type=attention_type,
                 kda_heads=getattr(config, "kda_heads", 64),
                 kda_head_dim=getattr(config, "kda_head_dim", 128),
@@ -283,6 +283,8 @@ class Transformer(nnx.Module):
 
         remat = getattr(config, "remat", True)
         policy = getattr(config, "remat_policy", "full")
+        self.remat = remat
+        self.remat_policy_name = policy
         self.n_dense = config.dense_layers
         self.n_moe = config.layers - config.dense_layers
 
@@ -305,42 +307,53 @@ class Transformer(nnx.Module):
             # of modules -- the blocks themselves are nnx modules tracked via
             # their own params, so the list wrapper must be static.
             self.blocks = nnx.data(self.blocks)
-            # Stash per-layer windows for the call path (0 = full causal).
-            self._windows = nnx.data([layer_window(i) for i in range(config.layers)])
+            # Per-layer static windows for the call path (0 = full causal).
+            self._windows = tuple(layer_window(i) for i in range(config.layers))
             self.dense_stack = None
             self.moe_stack = None
-            self._dense_windows = None
-            self._moe_windows = None
         else:
             # ---- Scan path: two homogeneous stacks (dense, moe). Each stack
-            # is lax.scan'd so XLA compiles one block body. SWA hybrid varies
-            # the window per-layer via a scanned `windows` array; KDA is
-            # incompatible with this path (see above) so use_kda forces the
-            # no-scan path.
-            def _stack_windows(ws):
-                if not ws or all(w == 0 for w in ws):
-                    return None
-                return jnp.asarray(ws, dtype=jnp.int32)
+            # is lax.scan'd so XLA compiles one block body. The SWA hybrid
+            # varies the window per layer through a static `window_choices`
+            # tuple plus a scanned index (see BlockStack); KDA is incompatible
+            # with this path (see above) so use_kda forces the no-scan path.
+            def _stack_plan(ws):
+                """(window_choices, window_sel) for one stack's per-layer windows.
 
-            dense_windows = ([layer_window(i) for i in range(self.n_dense)]
-                             if self.n_dense else [])
-            moe_windows = ([layer_window(self.n_dense + i) for i in range(self.n_moe)]
-                           if self.n_moe else [])
-            dense_static = (None if not dense_windows or dense_windows[0] == 0
-                            else dense_windows[0])
-            moe_static = (None if not moe_windows or moe_windows[0] == 0
-                          else moe_windows[0])
+                `ws` is a list of ints, 0 meaning full causal. The distinct
+                values become the static choice tuple; `window_sel` indexes into
+                it per layer, and is None when the stack is homogeneous so the
+                scan carries no window input at all.
+                """
+                if not ws:
+                    return None, None
+                uniq = sorted(set(ws))
+                choices = tuple(None if w == 0 else int(w) for w in uniq)
+                if len(choices) == 1:
+                    return choices, None
+                pos = {w: i for i, w in enumerate(uniq)}
+                return choices, tuple(pos[w] for w in ws)
 
-            self.dense_stack = (BlockStack(self.n_dense,
-                                           make_block(False, "full", dense_static),
-                                           remat, policy)
-                                if self.n_dense else None)
-            self.moe_stack = (BlockStack(self.n_moe,
-                                         make_block(True, "full", moe_static),
-                                         remat, policy)
-                              if self.n_moe else None)
-            self._dense_windows = _stack_windows(dense_windows)
-            self._moe_windows = _stack_windows(moe_windows)
+            dense_windows = [layer_window(i) for i in range(self.n_dense)]
+            moe_windows = [layer_window(self.n_dense + i) for i in range(self.n_moe)]
+            dense_choices, dense_sel = _stack_plan(dense_windows)
+            moe_choices, moe_sel = _stack_plan(moe_windows)
+            # When a stack is homogeneous the single choice is the block's
+            # static init-time window; when it is mixed the block gets the whole
+            # choice tuple and the scanned index selects among them.
+            dense_static = dense_choices[0] if (dense_choices and dense_sel is None) else None
+            moe_static = moe_choices[0] if (moe_choices and moe_sel is None) else None
+
+            self.dense_stack = (BlockStack(
+                self.n_dense,
+                make_block(False, "full", dense_static, dense_choices),
+                remat, policy, window_sel=dense_sel)
+                if self.n_dense else None)
+            self.moe_stack = (BlockStack(
+                self.n_moe,
+                make_block(True, "full", moe_static, moe_choices),
+                remat, policy, window_sel=moe_sel)
+                if self.n_moe else None)
             self.blocks = None
             self._windows = None
 
@@ -352,24 +365,36 @@ class Transformer(nnx.Module):
         cos, sin = self.rope_cos.value, self.rope_sin.value
 
         if self.use_scan:
-            # ---- Scan path (homogeneous dense + moe stacks) ----
+            # ---- Scan path (dense + moe stacks) ----
             if self.dense_stack is not None:
-                x, _ = self.dense_stack(x, cos, sin, positions,
-                                        windows=self._dense_windows)
+                x, _ = self.dense_stack(x, cos, sin, positions)
             aux_stacked = {}
             if self.moe_stack is not None:
-                x, aux_stacked = self.moe_stack(x, cos, sin, positions,
-                                                windows=self._moe_windows)
+                x, aux_stacked = self.moe_stack(x, cos, sin, positions)
         else:
             # ---- No-scan path: plain Python loop over blocks. Required for
             # the KDA hybrid (mixed module types). MoE aux is summed across
             # MoE layers; scalars are averaged, expert_counts is stacked.
+            #
+            # Remat is applied per block here just as BlockStack applies it per
+            # scan step. Without it this path holds every layer's activations
+            # live at once -- the scan path's `remat=True` would silently stop
+            # meaning anything the moment use_scan went False.
+            pol = (remat_policy(self.remat_policy_name)
+                   if self.remat and self.remat_policy_name != "none" else False)
             aux_list = []
             for i, block in enumerate(self.blocks):
                 w = self._windows[i]
                 # 0 -> None (full causal); KDA ignores the window anyway.
                 w_arg = None if w == 0 else w
-                x, aux = block(x, cos, sin, positions=positions, window=w_arg)
+                gd, st = nnx.split(block)
+
+                def call(carry, layer_state, _gd=gd, _w=w_arg):
+                    return nnx.merge(_gd, layer_state)(
+                        carry, cos, sin, positions=positions, window=_w)
+
+                f = call if pol is False else jax.checkpoint(call, policy=pol)
+                x, aux = f(x, st)
                 if aux:
                     aux_list.append(aux)
             # Merge aux the same way the scan path does (see below).

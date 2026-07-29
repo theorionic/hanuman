@@ -14,7 +14,79 @@ All numbers from TPU v5e-8 (8 chips, 197 TFLOP/s bf16 each = 1576 TFLOP/s),
 
 SWA is roughly neutral at seq_len=4096 -- the attention core is only ~15% of
 model FLOPs there, so halving it is worth ~1%. Its payoff is at long context,
-where the S^2 term dominates.
+where the S^2 term dominates; see the sequence-length section below, where at
+16384 the attention core is ~41% of model FLOPs.
+
+`step_flops()` models the per-layer SWA/KDA plan, so MFU stays honest when
+those hybrids are on. It did not originally, and counting windowed layers as
+full causal overstated SWA MFU by up to 8 points at 16384.
+
+## Sequence length is the biggest MFU lever found
+
+Every knob at seq_len 4096 is flat (see below), but training longer is not:
+
+| seq_len | remat | attention | ms/step | tok/s | MFU | hw MFU |
+|---|---|---|---|---|---|---|
+| 4,096 | dots_no_batch | full | 1119 | 29,300 | 11.5% | 15.2% |
+| 8,192 | dots_no_batch | full | 2388 | 27,449 | 12.4% | 16.3% |
+| 8,192 | dots_no_batch | SWA p2 w1024 | 2317 | 28,287 | -- | -- |
+| 16,384 | dots_no_batch | either | OOM (22.1 GB) | | | |
+| 4,096 | full | full | 2483 | 13,196 | 5.2% | 6.8% |
+| 8,192 | full | full | 5098 | 12,856 | 5.8% | 7.6% |
+| **16,384** | **full** | **full** | **3496** | **37,487** | **21.2%** | **28.0%** |
+| 16,384 | full | SWA p2 w1024 | 3197 | 40,970 | 19.1% | 25.2% |
+| 16,384 | full | SWA p4 w1024 | 3043 | 43,078 | 17.8% | 23.5% |
+| 16,384 | full | SWA p8 w1024 | 2965 | **44,201** | 17.2% | 22.6% |
+| 32,768 | full | either | OOM (21.0 GB) | | | |
+
+Best MFU is 21.2% at seq_len 16384 with full attention -- nearly double the
+4096 baseline. Best *throughput* is 44,201 tok/s with SWA period 8, +51% over
+the 4096 baseline.
+
+MFU and throughput diverge under SWA because SWA removes real FLOPs: the model
+gets cheaper rather than the chip busier, so tok/s rises while MFU falls. Both
+numbers are correct; tok/s is the one that decides how long a run takes.
+
+Two counter-intuitive results here, both reproduced across three timing windows
+and two separate processes:
+
+- **seq 16384 is faster in absolute terms than seq 8192 under remat=full**
+  (3496 ms for 2x the tokens of 8192's 5098 ms). 4096 and 8192 scale linearly
+  with each other, so 16384 is the outlier in the *good* direction. The likely
+  cause is `ragged_dot` selecting a better tiling once the row count reaches
+  131072 (cf. the `scoped_vmem_limit_kib` note in main.py, where the same op is
+  already known to pick tilings sensitive to size and VMEM budget). Not chased
+  further, but it means **do not assume the 4096 and 8192 numbers extrapolate**.
+- **remat_policy=full is 2.2x slower at 4096 and 8192, but is the only policy
+  that fits at 16384** -- and at 16384 it beats every measurement at shorter
+  context anyway. The right policy depends on sequence length; `dots_no_batch`
+  is right at 4096, `full` at 16384.
+
+Attention mechanism in isolation (8 layers, fwd+bwd, batch 8, window 1024),
+which is what SWA is actually for:
+
+| seq_len | full causal | SWA | alternating hybrid | SWA speedup |
+|---|---|---|---|---|
+| 4,096 | 14.5 ms | 10.4 | 13.6 | 1.40x |
+| 8,192 | 49.9 | 22.4 | 38.6 | 2.23x |
+| 16,384 | 178.4 | 47.5 | 119.3 | 3.76x |
+| 32,768 | 688.7 | 96.8 | 399.3 | 7.12x |
+| 65,536 | 2669.8 | 194.0 | 1444.6 | 13.76x |
+
+Full causal scales ~3.9x per doubling (O(S^2)); SWA ~2.05x (O(S)). The hybrid
+is asymptotically bounded by its full-attention layers -- at period 2 it can
+never beat 2x, which is why period 4 and 8 are worth the modelling tradeoff at
+long context.
+
+Note that `swa_period=8` on a 24-layer model leaves only 3 full-attention
+layers (7, 15, 23). That is an aggressive ratio -- Qwen2/Gemma2 use 1:1 -- and
+whether those 3 layers carry enough long-range capability is a modelling
+question, not a throughput one.
+
+The context ceiling is the MoE dispatch, not attention: Splash is already O(S)
+in memory, and the 16384 OOM under dots_no_batch and the 32768 OOM under full
+are both driven by the `[T*K, D]` dispatch intermediates. Going past 16K needs
+either a chunked dispatch or sequence parallelism.
 
 ## Where the step actually goes
 

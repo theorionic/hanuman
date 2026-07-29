@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import time
 from functools import partial
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -73,6 +74,44 @@ def count_total_params(config: Config) -> int:
     return total
 
 
+def _attn_core_flops(S: int, Nq: int, H: int, window: Optional[int]) -> float:
+    """Per-token FLOPs of the attention core (QK^T and PV) for one layer.
+
+    Both matmuls cost 2*Nq*H FLOPs per (query, key) pair, so the core is
+    4*Nq*H*avg_keys where avg_keys is the mean number of keys a query attends
+    to. Full causal gives (S+1)/2, recovering the usual 2*Nq*H*S.
+
+    A causal sliding window of W attends to min(W, i+1) keys at position i, so
+    avg_keys = (W(W+1)/2 + (S-W)*W) / S -- roughly W once S >> W, i.e. linear
+    in S instead of quadratic. Counting SWA layers as full causal (which this
+    function used to do unconditionally) inflates reported MFU substantially:
+    at S=16384 the attention core is ~41% of model FLOPs, so crediting the
+    model for work a windowed layer never does overstates MFU by several
+    points.
+    """
+    if window is None or window >= S:
+        avg_keys = (S + 1) / 2
+    else:
+        W = float(window)
+        avg_keys = (W * (W + 1) / 2 + (S - W) * W) / S
+    return 4 * Nq * H * avg_keys
+
+
+def _kda_flops(config: Config, D: int) -> float:
+    """Per-token FLOPs of one KDA layer (projections + recurrent state ops)."""
+    Hk = getattr(config, "kda_heads", 64)
+    Kd = getattr(config, "kda_head_dim", 128)
+    V = Kd
+    proj = 2 * D * (3 * Hk * Kd)                 # q, k, v
+    proj += 2 * D * Kd + 2 * Kd * (Hk * Kd)      # f_proj (two linears)
+    proj += 2 * D * Kd + 2 * Kd * (Hk * V)       # g_proj (two linears)
+    proj += 2 * D * Hk                           # beta
+    proj += 2 * (Hk * V) * D                     # w_o
+    # Recurrence per token: decay, S@k, outer, update, S@q -- all [H, K, V].
+    state = 8 * Hk * Kd * V
+    return proj + state
+
+
 def step_flops(config: Config) -> tuple[int, int]:
     """(model_flops, hardware_flops) for one training step.
 
@@ -81,17 +120,30 @@ def step_flops(config: Config) -> tuple[int, int]:
     rematerialization pays inside each block. MFU against the first is the
     standard number quoted for a model; against the second it is what the chip
     actually executed.
+
+    Per-layer attention cost follows the same SWA/KDA layer plan the model
+    builds, so MFU stays honest when those hybrids are on.
     """
     D, dff, S = config.d_model, config.d_ff, config.seq_len
     Nq, Nkv, H = config.n_q_heads, config.n_kv_heads, config.head_dim
     L, n_dense = config.layers, config.dense_layers
-    n_moe = L - n_dense
 
-    # attention projections (wq, wk, wv, wo)
-    proj = 2 * D * (Nq * H + 2 * Nkv * H + Nq * H)
-    # causal attention core: QK^T and PV, each averaging S/2 keys per query
-    core = 2 * Nq * H * S
-    attn = proj + core
+    use_kda = getattr(config, "use_kda", False)
+    use_swa = getattr(config, "use_swa", False)
+    kda_period = getattr(config, "kda_period", 4)
+    swa_period = getattr(config, "swa_period", 2)
+    swa_window = getattr(config, "swa_window", 4096)
+
+    def layer_attn_flops(i: int) -> float:
+        """Per-token attention FLOPs for layer i, matching Transformer's plan."""
+        if use_kda and (i % kda_period != kda_period - 1):
+            return _kda_flops(config, D)
+        # GQA projections (wq, wk, wv, wo) are the same for full and SWA.
+        proj = 2 * D * (Nq * H + 2 * Nkv * H + Nq * H)
+        window = None
+        if (not use_kda) and use_swa and (i % swa_period != swa_period - 1):
+            window = swa_window
+        return proj + _attn_core_flops(S, Nq, H, window)
 
     dffd = getattr(config, "d_ff_dense", None) or dff
     dense_ffn = 2 * 3 * D * dffd
@@ -100,14 +152,18 @@ def step_flops(config: Config) -> tuple[int, int]:
     router = 2 * D * config.n_experts
     head = 2 * D * config.vocab_size
 
-    fwd_per_token = n_dense * (attn + dense_ffn) + n_moe * (attn + moe_ffn + router) + head
+    block_fwd = 0.0
+    for i in range(L):
+        ffn = dense_ffn if i < n_dense else (moe_ffn + router)
+        block_fwd += layer_attn_flops(i) + ffn
+
+    fwd_per_token = block_fwd + head
     tokens = config.batch_size * config.seq_len
 
     model = 3 * fwd_per_token * tokens
     # remat recomputes every block's forward; the head and embedding are outside.
-    block_fwd = n_dense * (attn + dense_ffn) + n_moe * (attn + moe_ffn + router)
     hardware = model + (block_fwd * tokens if getattr(config, "remat", True) else 0)
-    return model, hardware
+    return int(model), int(hardware)
 
 
 def peak_flops_per_device() -> float:

@@ -286,7 +286,36 @@ def full_g4() -> Config:
     return c
 
 
-PRESETS = {"smoke": smoke, "smoke_kda": smoke_kda, "full": full, "full_g4": full_g4}
+def custom() -> Config:
+    """Template for training on your own HuggingFace dataset via Grain.
+
+    Copy this function, change the 4 fields marked <-- CHANGE, and run:
+        python main.py train --config custom --steps 1000
+
+    The dataset must be parquet shards on the HF hub. Find the glob pattern at
+    https://huggingface.co/datasets/<repo>/tree/main  (look for *.parquet files).
+
+    If the dataset is gated, set:  export HF_TOKEN=hf_xxxxx
+    """
+    c = full()  # inherit model + training hyperparams from full
+    c.name = "custom"
+
+    # ---- 4 fields to change for your dataset ----
+    c.dataset = "openbmb/Ultra-FineWeb-L3"                          # <-- CHANGE: HF repo id
+    c.dataset_files = (                                             # <-- CHANGE: parquet glob
+        "hf://datasets/openbmb/Ultra-FineWeb-L3/"
+        "data/ultrafineweb_en_l3/multi_style/*.parquet")
+    c.tokenizer = "llama3"                                          # <-- CHANGE: 'llama3' | HF repo id | 'byte'
+    c.vocab_size = 32000                                            # <-- CHANGE: must match tokenizer
+    # --------------------------------------------
+
+    c.use_grain = True              # Grain pipeline (parquet -> tokenize -> pack -> device_put)
+    c.dataset_config = None         # set only if the repo has named configs AND dataset_files is None
+    return c
+
+
+PRESETS = {"smoke": smoke, "smoke_kda": smoke_kda, "full": full,
+           "full_g4": full_g4, "custom": custom}
 
 
 def get_config(name: str) -> Config:

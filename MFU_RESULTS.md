@@ -14,8 +14,18 @@ dispatch-bound MoE path (~46% of peak) to the dispatch-free dense path (~92% of
 peak)**, combined with **top-1 routing** to minimize the [T*K, D] dispatch buffer
 and free HBM for the wider shared expert.
 
-Best MFU reached: **34.9%** (top-1 + d_ff_dense=12288) — +61% over the old
-default (21.6%). Best throughput: **54,123 tok/s** (top-2-of-40).
+Best MFU reached: **41.4%** (batch 8, 10 dense, top-1, d_ff_dense=16384) — +91%
+over the old default (21.6%). Best throughput: **83,034 tok/s** (batch 16, 14
+dense, top-1, d_ff_dense=2048) — +118% over the old default (38,132).
+
+Two new levers found, both beyond OPTIMIZATION.md:
+1. **Wider shared expert (d_ff_dense)** — shifts compute from the dispatch-bound
+   MoE path (~46% peak) to the dispatch-free dense path (~92% peak).
+2. **More dense layers** — shifting the dense:MoE ratio from 3:21 to 10:14 fills
+   dispatch gaps with efficient dense compute. Sweet spot at 10 dense (39.3% MFU
+   at batch 8). Combined with wider shared expert, reaches 41.4%.
+3. **Batch 16** — doubles throughput by amortizing dispatch overhead. Requires
+   10-14 dense layers (fewer MoE dispatch buffers) to fit in HBM.
 
 ## Results table
 
@@ -32,6 +42,51 @@ default (21.6%). Best throughput: **54,123 tok/s** (top-2-of-40).
 | top-1-of-40, d_ff=1536 + d_ff_dense=8192 | 2815 | 46,566 | 33.0% | 43.7% | 9.54 GB | +11.4 MFU |
 | top-1-of-40, d_ff=1536 + d_ff_dense=10240 | 3107 | 42,187 | 33.5% | 44.4% | 9.71 GB | +11.9 MFU |
 | **top-1-of-40, d_ff=1536 + d_ff_dense=12288** | **3311** | **39,592** | **34.9%** | **46.2%** | **9.88 GB** | **+13.3 MFU** |
+
+### Dense-layer ratio sweep (batch 8, top-1, d_ff_dense=12288)
+
+Shifting the dense:MoE ratio from 3:21 to 10:14 fills dispatch gaps with
+efficient dense compute. Sweet spot at 10 dense (39.3% MFU). Non-monotonic:
+MFU rises as dense fills gaps, then falls when too few MoE layers remain.
+
+| dense_layers | ms/step | tok/s | MFU | hw MFU | HBM peak |
+|---|---|---|---|---|---|
+| 3 (default) | 3311 | 39,592 | 34.9% | 46.2% | 9.88 GB |
+| 6 | 3085 | 42,488 | 37.1% | 49.2% | 9.24 GB |
+| 8 | 2973 | 44,087 | 38.2% | 50.7% | 8.81 GB |
+| **10** | **2874** | **45,607** | **39.3%** | **52.1%** | **8.40 GB** |
+| 11 | 3039 | 43,130 | 37.0% | 49.1% | 8.19 GB |
+| 12 | 3277 | 39,995 | 34.2% | 45.4% | 7.98 GB |
+| 14 | 3107 | 42,180 | 35.9% | 47.6% | 7.56 GB |
+
+### Best MFU — batch 8, 10 dense, top-1, wider shared expert
+
+With 10 dense layers freeing HBM (8.40 GB used), d_ff_dense can push past the
+12288 ceiling that OOMed at 3 dense layers.
+
+| d_ff_dense | ms/step | tok/s | MFU | hw MFU | HBM peak |
+|---|---|---|---|---|---|
+| 12288 | 2874 | 45,607 | 39.3% | 52.1% | 8.40 GB |
+| 13312 | 2966 | 44,199 | 40.0% | 53.0% | 8.49 GB |
+| 14336 | 3060 | 42,832 | 40.6% | 53.9% | 8.58 GB |
+| **16384** | **3276** | **40,014** | **41.4%** | **54.9%** | **8.76 GB** |
+| 20480 | 3725 | 35,187 | 42.5% | 56.4% | 9.07 GB |
+
+### Batch 16 — best throughput (doubling batch amortizes dispatch overhead)
+
+Batch 16 requires 10-14 dense layers (fewer MoE dispatch buffers) to fit HBM.
+The dispatch buffer scales with batch, so d_ff_dense must shrink to compensate.
+
+| config | ms/step | tok/s | MFU | hw MFU | HBM peak |
+|---|---|---|---|---|---|
+| dense=10, top-1, d_ff=1536, d_ff_dense=2048 | 3429 | 76,459 | 31.3% | 41.2% | 7.52 GB |
+| dense=10, top-1, d_ff=1536, d_ff_dense=3072 | 3697 | 70,901 | 33.6% | 44.3% | 7.64 GB |
+| dense=12, top-1, d_ff=1536, d_ff_dense=3072 | 3438 | 76,251 | 35.7% | 47.1% | 7.21 GB |
+| **dense=14, top-1, d_ff=1536, d_ff_dense=2048** | **3157** | **83,034** | **34.8%** | **45.9%** | **6.71 GB** |
+| dense=10, top-1, d_ff=768, d_ff_dense=4096 | 3464 | 75,687 | 37.7% | 49.8% | 6.24 GB |
+| dense=10, top-2, d_ff=1536, d_ff_dense=2048 | 3898 | 67,250 | 31.5% | 41.6% | 7.56 GB |
+| dense=10, top-1, d_ff_dense=4096 | OOM (15.82 GB) | — | — | — | — |
+| dense=10, top-1, d_ff_dense=8192 | OOM (17.12 GB) | — | — | — | — |
 
 ### SWA hybrid variants (throughput levers on full_g4, window 1024)
 
@@ -132,19 +187,50 @@ shared memory has no alignment constraint.
 
 | goal | config | MFU | tok/s | how |
 |---|---|---|---|---|
-| Max MFU (chip efficiency) | top-1 + d_ff_dense=12288 | 34.9% | 39,592 | `--n_active 1 --d_ff 1536 --d_ff_dense 12288` |
-| Max throughput (training speed) | top-2-of-40 | 24.5% | 54,123 | `--n_active 2 --d_ff 1536` |
-| Balanced (safe default) | full_g4 | 25.7% | 45,459 | already the default |
+| Max MFU (chip efficiency) | batch 8, 10 dense, top-1, d_ff_dense=16384 | 41.4% | 40,014 | `./train_best.sh mfu` |
+| Max throughput (training speed) | batch 16, 14 dense, top-1, d_ff_dense=2048 | 34.8% | 83,034 | `./train_best.sh throughput` |
+| Balanced (quality + efficiency) | batch 16, 10 dense, top-1, d_ff=768, d_ff_dense=4096 | 37.7% | 75,687 | `./train_best.sh balanced` |
+| Quality-preserving (top-2) | batch 16, 10 dense, top-2, d_ff_dense=2048 | 31.5% | 67,248 | `./train_best.sh quality` |
+| Safe default (validated) | full_g4 | 25.7% | 45,459 | `python main.py train` |
 
-The 34.9% MFU config is real and measured but is a different model (more params,
-top-1 routing, dense-heavy). Before adopting for real training, run a loss-curve
-comparison over a few thousand steps to confirm the modelling tradeoff is
-acceptable. The default remains full_g4 (25.7%) as the safe, validated choice.
+All high-MFU configs are **different models** (more params, top-1 routing,
+dense-heavy). Loss parity at step 10-15 looks fine (~10.88 across all), but a
+real loss-curve comparison over thousands of steps on real data is needed
+before adopting for production training. The default remains full_g4 (25.7%)
+as the safe, validated choice.
+
+## Quality vs efficiency tradeoff
+
+The key question: does shifting compute from routed experts to the shared
+dense expert degrade model quality? The answer depends on what you value:
+
+- **Fine-grained expert specialization** (DeepSeekMoE philosophy): more MoE
+  layers + top-2+ routing = more expert diversity. The high-MFU configs dilute
+  this. If expert specialization is the value, use `quality` or `full_g4`.
+- **Dense compute efficiency** (sheer throughput): the shared expert is a
+  capable dense FFN. DeepSeek-V3 itself uses a large shared expert alongside
+  routed experts. The `balanced` config (d_ff=768, d_ff_dense=4096) keeps 14
+  MoE layers for specialization while shifting bulk compute to the efficient
+  dense path — likely the best quality/efficiency point.
+- **Top-1 vs top-2**: top-1 halves dispatch but reduces per-token expert
+  diversity. Most production MoE models use top-2+. If loss curves diverge
+  over long training, switch to the `quality` profile (top-2).
+
+**Recommendation for real training**: start with `balanced` (37.7% MFU, 75.7k
+tok/s). It keeps 14 MoE layers, uses smaller routed experts (d_ff=768) to
+shrink dispatch, and a moderately wide shared expert (4096). Run a few
+thousand steps on real data and compare loss against `full_g4`. If loss
+parity holds, it's a 1.7× throughput win at +12 MFU.
 
 ## Code changes applied
 
-- `main.py`: default config changed from `smoke` to `full_g4` for `train`,
-  `count`, and `report` subcommands.
-- No other code changes. The gate/up ragged_dot merge was tested and reverted
-  (it regressed full_g4). The entropy-diagnostic skip was tested and reverted
-  (it is already free). moe.py is unchanged from its original state.
+- `main.py`: default config changed to `full_g4`; added `--dense_layers` CLI
+  override for the dense:MoE layer ratio.
+- `model/moe.py`: added `_USE_MEGABLOX` env flag (tested, 3.5× slower,
+  disabled by default). No functional change to the dispatch path.
+- `train_best.sh`: new script with 4 training profiles (mfu/throughput/
+  balanced/quality) encoding the best measured configs.
+- The gate/up ragged_dot merge was tested and reverted (regressed full_g4).
+- The entropy-diagnostic skip was tested and reverted (already free).
+- KDA hybrid tested — OOMs (32.8 GB), ruled out.
+- Megablox GMM tested — 3.5× slower than ragged_dot, ruled out.

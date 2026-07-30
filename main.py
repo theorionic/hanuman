@@ -73,6 +73,8 @@ def cmd_train(args):
         config.d_ff_dense = args.d_ff_dense
     if args.n_active is not None:
         config.n_active = args.n_active
+    if args.dense_layers is not None:
+        config.dense_layers = args.dense_layers
     if args.z_weight is not None:
         config.z_loss_weight = args.z_weight
     if args.bias_rate is not None:
@@ -165,6 +167,8 @@ def main():
     p_train.add_argument("--d_ff_dense", type=int, default=None,
                          help="Shared-expert / dense-layer FFN width (default: same as --d_ff)")
     p_train.add_argument("--n_active", type=int, default=None, help="Top-k routed experts")
+    p_train.add_argument("--dense_layers", type=int, default=None,
+                         help="Number of first layers using dense FFN (rest are MoE)")
     p_train.add_argument("--z_weight", type=float, default=None,
                          help="Router z-loss weight")
     p_train.add_argument("--bias_rate", type=float, default=None,

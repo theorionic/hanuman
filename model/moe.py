@@ -31,6 +31,7 @@ def swiglu(x, w_gate, w_up, w_down, dtype):
 
 _ROW_ALIGN = 128  # TPU tile alignment for the grouped-matmul row dimension
 _BARRIER = os.environ.get("HANUMAN_MOE_BARRIER", "1") == "1"
+_USE_MEGABLOX = os.environ.get("HANUMAN_USE_MEGABLOX", "0") == "1"  # tested: 3.5x slower, disabled
 
 
 def ragged_dispatch(x_flat, top_idx, weights, w_gate, w_up, w_down, dtype):

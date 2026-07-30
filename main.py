@@ -150,7 +150,11 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_train = sub.add_parser("train", help="Run training")
-    p_train.add_argument("--config", default="smoke", choices=list(__import__("config").PRESETS))
+    # full_g4 is the default: top-4-of-40 x d_ff 1536 (identical params/FLOPs to
+    # full's top-8-of-80 x 768) halves the dispatch row count, measured 25.7% MFU
+    # / 45.5k tok/s vs full's 21.6% / 38.2k (+19% throughput, +4 MFU). See
+    # BENCHMARKS.md "Expert granularity is the cheapest large win".
+    p_train.add_argument("--config", default="full_g4", choices=list(__import__("config").PRESETS))
     p_train.add_argument("--steps", type=int, default=None)
     p_train.add_argument("--batch", type=int, default=None)
     p_train.add_argument("--seq_len", type=int, default=None)
@@ -216,10 +220,10 @@ def main():
     p_gen.set_defaults(func=cmd_generate)
 
     p_count = sub.add_parser("count", help="Print param counts")
-    p_count.add_argument("--config", default="full", choices=list(__import__("config").PRESETS))
+    p_count.add_argument("--config", default="full_g4", choices=list(__import__("config").PRESETS))
 
     p_report = sub.add_parser("report", help="Per-tensor sharding and HBM table")
-    p_report.add_argument("--config", default="full", choices=list(__import__("config").PRESETS))
+    p_report.add_argument("--config", default="full_g4", choices=list(__import__("config").PRESETS))
     p_report.set_defaults(func=cmd_report)
     p_count.set_defaults(func=cmd_count)
 

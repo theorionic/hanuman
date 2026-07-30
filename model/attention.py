@@ -254,17 +254,10 @@ class Attention(nnx.Module):
 
         qkv_dim = n_q_heads * head_dim
         kv_dim = n_kv_heads * head_dim
-        # Fused QKV projection: one matmul reads x from HBM once instead of
-        # three times (x is [B, S, D] bf16 = ~805 MB at the 7B config). The
-        # fused weight [D, qkv_dim + 2*kv_dim] is the same total bytes as the
-        # three separate weights -- no extra memory. XLA compiles the single
-        # dot natively; no custom kernel needed. The output is sliced into
-        # q/k/v (XLA emits these as views, no copy).
-        #   layout: [q (Nq*H) | k (Nkv*H) | v (Nkv*H)]
-        self.qkv_split = (qkv_dim, qkv_dim + kv_dim, qkv_dim + 2 * kv_dim)
-        fused_dim = qkv_dim + 2 * kv_dim
         std = (1.0 / d_model) ** 0.5
-        self.wqkv = nnx.Param(jax.random.normal(rngs.params(), (d_model, fused_dim)) * std)
+        self.wq = nnx.Param(jax.random.normal(rngs.params(), (d_model, qkv_dim)) * std)
+        self.wk = nnx.Param(jax.random.normal(rngs.params(), (d_model, kv_dim)) * std)
+        self.wv = nnx.Param(jax.random.normal(rngs.params(), (d_model, kv_dim)) * std)
         self.wo = nnx.Param(jax.random.normal(rngs.params(), (qkv_dim, d_model)) * std)
 
     def __call__(self, x, cos, sin, positions=None, window: int | None = None,
@@ -275,12 +268,9 @@ class Attention(nnx.Module):
         w = window if window is not None else self.window
         B, S, D = x.shape
         x = x.astype(self.dtype)
-        # Fused QKV: one matmul, then slice into q/k/v (XLA views, no copy).
-        qkv = x @ self.wqkv.astype(self.dtype)  # [B, S, qkv_dim + 2*kv_dim]
-        q1, k1, v1 = self.qkv_split
-        q = qkv[..., :q1]                       # [B, S, Nq*H]
-        k = qkv[..., q1:k1]                     # [B, S, Nkv*H]
-        v = qkv[..., k1:v1]                     # [B, S, Nkv*H]
+        q = x @ self.wq.astype(self.dtype)  # [B, S, Nq*H]
+        k = x @ self.wk.astype(self.dtype)  # [B, S, Nkv*H]
+        v = x @ self.wv.astype(self.dtype)
         q = q.reshape(B, S, self.n_q_heads, self.head_dim)
         k = k.reshape(B, S, self.n_kv_heads, self.head_dim)
         v = v.reshape(B, S, self.n_kv_heads, self.head_dim)

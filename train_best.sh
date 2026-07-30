@@ -39,17 +39,19 @@ quality() {
 
 # ----------------------------------------------------------------------------
 # 2. QUALITY + THROUGHPUT — SOTA ratio, batch 16, top-2
-#    batch 16, 3 dense + 21 MoE, top-2, d_ff_dense=3072 (2.0x ratio)
-#    Same 25% shared compute as the quality profile, but top-2 routing (less
-#    dispatch) and batch 16 (2x throughput). d_ff_dense=3072 fits batch 16
-#    with top-2. Use this when you want SOTA-grounded quality AND speed.
+#    batch 16, 10 dense + 14 MoE, top-2, d_ff_dense=2048 (1.3x ratio)
+#    Top-2 routing preserves expert diversity. Batch 16 doubles throughput.
+#    d_ff_dense=2048 (1.3x) fits the HBM budget at batch 16 with top-2 dispatch.
+#    10 dense layers reduce MoE dispatch buffers enough to fit. Slightly below
+#    the 2.0x SOTA ratio but keeps top-2 routing (better quality than top-1).
 # ----------------------------------------------------------------------------
 quality_speed() {
   python main.py train \
     --config full_g4 \
     --n_active 2 \
     --d_ff 1536 \
-    --d_ff_dense 3072 \
+    --d_ff_dense 2048 \
+    --dense_layers 10 \
     --batch 16 \
     "$@"
 }
@@ -118,11 +120,11 @@ usage() {
 Usage: $0 <profile> [extra args passed to main.py]
 
 Profiles (ordered by quality -> speed):
-  quality      SOTA 2.0x shared, top-4, batch 8  [RECOMMENDED for real training]
-  quality_speed SOTA 2.0x shared, top-2, batch 16 [quality + 2x throughput]
-  balanced     2.7x shared, top-1, batch 16       [efficiency-focused]
-  throughput   1.3x shared, top-1, batch 16       [max tok/s: 83k]
-  mfu          10.7x shared, top-1, batch 8       [BENCHMARK ONLY - not for training]
+  quality       2.0x shared, top-4, batch 8   [RECOMMENDED for real training]
+  quality_speed 1.3x shared, top-2, batch 16  [quality + 2x throughput]
+  balanced      2.7x shared, top-1, batch 16  [efficiency-focused]
+  throughput    1.3x shared, top-1, batch 16  [max tok/s: 83k]
+  mfu          10.7x shared, top-1, batch 8  [BENCHMARK ONLY - not for training]
 
 SOTA shared-expert ratio reference:
   DeepSeek-V3: 1.0x | DeepSeek-V2: 2.0x | Llama 4: 1.0x | Granite: 2.0x
